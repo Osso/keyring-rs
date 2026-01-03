@@ -1,0 +1,33 @@
+[package]
+name = "keyring-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Minimal Secret Service D-Bus daemon"
+
+[dependencies]
+# D-Bus
+zbus = "5"
+
+# Storage (pure Rust embedded DB)
+redb = "2"
+
+# Encryption
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utils
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
