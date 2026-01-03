@@ -1,13 +1,14 @@
 // D-Bus Secret Service implementation
 // https://specifications.freedesktop.org/secret-service/latest/
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{interface, Connection};
 use zbus::object_server::SignalEmitter;
 
+use crate::access::AccessControl;
 use crate::storage::Storage;
 
 // Secret struct as per D-Bus spec: (session, parameters, value, content_type)
@@ -16,6 +17,8 @@ type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 pub struct SecretService {
     storage: Arc<RwLock<Storage>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
+    access: Arc<AccessControl>,
+    connection: Connection,
 }
 
 struct Session {
@@ -24,11 +27,44 @@ struct Session {
 }
 
 impl SecretService {
-    pub fn new(storage: Arc<RwLock<Storage>>) -> Self {
+    pub fn new(storage: Arc<RwLock<Storage>>, access: Arc<AccessControl>, connection: Connection) -> Self {
         Self {
             storage,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            access,
+            connection,
         }
+    }
+
+    /// Get the PID of the D-Bus caller
+    async fn get_caller_pid(&self, sender: &str) -> Option<u32> {
+        let reply = self.connection
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetConnectionUnixProcessID",
+                &(sender,),
+            )
+            .await
+            .ok()?;
+
+        reply.body().deserialize::<u32>().ok()
+    }
+
+    /// Check if caller is authorized, prompting if needed
+    async fn check_caller_access(&self, sender: &str) -> zbus::fdo::Result<()> {
+        let pid = self.get_caller_pid(sender).await
+            .ok_or_else(|| zbus::fdo::Error::Failed("Could not get caller PID".into()))?;
+
+        let allowed = self.access.check_access(pid).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        if !allowed {
+            return Err(zbus::fdo::Error::AccessDenied("Access denied by user".into()));
+        }
+
+        Ok(())
     }
 }
 
@@ -92,7 +128,13 @@ impl SecretService {
         &self,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
+        #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<HashMap<OwnedObjectPath, Secret>> {
+        // Check caller access
+        if let Some(sender) = header.sender() {
+            self.check_caller_access(sender.as_str()).await?;
+        }
+
         let storage: RwLockReadGuard<'_, Storage> = self.storage.read().await;
         let mut result: HashMap<OwnedObjectPath, Secret> = HashMap::new();
 
@@ -178,12 +220,43 @@ impl SecretService {
 // Collection interface
 pub struct SecretCollection {
     storage: Arc<RwLock<Storage>>,
+    access: Arc<AccessControl>,
+    connection: Connection,
     name: String,
 }
 
 impl SecretCollection {
-    pub fn new(storage: Arc<RwLock<Storage>>, name: String) -> Self {
-        Self { storage, name }
+    pub fn new(storage: Arc<RwLock<Storage>>, access: Arc<AccessControl>, connection: Connection, name: String) -> Self {
+        Self { storage, access, connection, name }
+    }
+
+    async fn get_caller_pid(&self, sender: &str) -> Option<u32> {
+        let reply = self.connection
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetConnectionUnixProcessID",
+                &(sender,),
+            )
+            .await
+            .ok()?;
+
+        reply.body().deserialize::<u32>().ok()
+    }
+
+    async fn check_caller_access(&self, sender: &str) -> zbus::fdo::Result<()> {
+        let pid = self.get_caller_pid(sender).await
+            .ok_or_else(|| zbus::fdo::Error::Failed("Could not get caller PID".into()))?;
+
+        let allowed = self.access.check_access(pid).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        if !allowed {
+            return Err(zbus::fdo::Error::AccessDenied("Access denied by user".into()));
+        }
+
+        Ok(())
     }
 }
 
@@ -463,25 +536,25 @@ impl SecretItem {
     }
 }
 
-pub async fn start_service(storage: Arc<RwLock<Storage>>) -> zbus::Result<Connection> {
+pub async fn start_service(storage: Arc<RwLock<Storage>>, access: Arc<AccessControl>) -> zbus::Result<Connection> {
     let connection = Connection::session().await?;
 
     // Register main service
-    let service = SecretService::new(storage.clone());
+    let service = SecretService::new(storage.clone(), access.clone(), connection.clone());
     connection
         .object_server()
         .at("/org/freedesktop/secrets", service)
         .await?;
 
     // Register default collection
-    let collection = SecretCollection::new(storage.clone(), "default".to_string());
+    let collection = SecretCollection::new(storage.clone(), access.clone(), connection.clone(), "default".to_string());
     connection
         .object_server()
         .at("/org/freedesktop/secrets/collection/default", collection)
         .await?;
 
     // Register alias for default collection
-    let alias_collection = SecretCollection::new(storage.clone(), "default".to_string());
+    let alias_collection = SecretCollection::new(storage.clone(), access.clone(), connection.clone(), "default".to_string());
     connection
         .object_server()
         .at("/org/freedesktop/secrets/aliases/default", alias_collection)

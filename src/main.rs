@@ -1,3 +1,4 @@
+mod access;
 mod crypto;
 mod dbus;
 mod error;
@@ -48,8 +49,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let storage = Arc::new(RwLock::new(storage));
 
+    // Initialize access control (prompt enabled by default)
+    let access = Arc::new(access::AccessControl::new(true));
+
     // Start D-Bus service
-    let connection = dbus::start_service(storage.clone()).await?;
+    let connection = dbus::start_service(storage.clone(), access.clone()).await?;
 
     tracing::info!("Daemon ready, waiting for requests...");
 
