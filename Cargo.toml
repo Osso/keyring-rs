@@ -33,6 +33,7 @@ rmp-serde = "1"
 # Auth daemon IPC
 peercred-ipc = { path = "/home/osso/Projects/lib/peercred-ipc" }
 authd-protocol = { path = "/home/osso/Projects/system/authd/protocol" }
+keyring-protocol = { path = "protocol" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -3,6 +3,7 @@ mod crypto;
 mod dbus;
 mod error;
 mod storage;
+mod unlock;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = data_path.join("secrets.db");
     tracing::info!("Using database: {}", db_path.display());
 
-    let mut storage = storage::Storage::open(&db_path)?;
+    let storage = storage::Storage::open(&db_path)?;
 
     // Create default collection if it doesn't exist
     if storage.get_collection("default")?.is_none() {
@@ -43,14 +44,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage.create_collection("default", "Default Keyring")?;
     }
 
-    // For now, auto-unlock with empty password (TODO: proper unlock flow)
-    // In production, this should prompt for password
-    storage.unlock("")?;
-
     let storage = Arc::new(RwLock::new(storage));
 
     // Initialize access control (prompt enabled by default)
     let access = Arc::new(access::AccessControl::new(true));
+
+    // Start unlock server (for greetd integration)
+    let unlock_storage = storage.clone();
+    let unlock_handle = tokio::spawn(async move {
+        let server = unlock::UnlockServer::new(unlock_storage);
+        if let Err(e) = server.run().await {
+            tracing::error!("Unlock server error: {}", e);
+        }
+    });
 
     // Start D-Bus service
     let connection = dbus::start_service(storage.clone(), access.clone()).await?;
@@ -61,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::signal::ctrl_c().await?;
     tracing::info!("Shutting down");
 
+    unlock_handle.abort();
     drop(connection);
     Ok(())
 }

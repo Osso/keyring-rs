@@ -139,10 +139,22 @@ struct Attribute {
 
 ## Unlock Flow
 
+### At Login (Primary)
+
+1. User logs in via greetd greeter
+2. greetd authenticates via PAM
+3. greetd sends `UnlockRequest` to keyring-rs unlock socket
+4. keyring-rs derives key from password, unlocks default collection
+5. User session starts with keyring already unlocked
+
+### On Demand (Fallback)
+
+If keyring wasn't unlocked at login (different password, daemon wasn't running):
+
 1. Client calls `Unlock([collection_path])`
 2. Daemon returns prompt path
 3. Client calls `Prompt(window_id)` on prompt
-4. Daemon spawns password dialog (via xdg-desktop-portal or custom)
+4. Daemon requests password via authd (confirm dialog with password field)
 5. User enters password
 6. Daemon derives key, unlocks collection
 7. Prompt emits `Completed(false, [collection_path])`
@@ -155,16 +167,85 @@ struct Attribute {
 - `argon2` - Password hashing (memory-hard KDF)
 - `tokio` - Async runtime
 - `serde` - Serialization for storage
+- `peercred-ipc` - Unix socket IPC with peer credential verification
+- `authd-protocol` - Per-app access control dialogs (via authd)
 
 ## File Locations
 
-- `~/.local/share/keyring-rs/secrets.db` - Encrypted database
+- `~/.local/state/keyring-rs/secrets.db` - Encrypted database (XDG_STATE_HOME)
 - `~/.config/keyring-rs/config.toml` - Configuration (optional)
-- `/run/user/$UID/keyring-rs/` - Runtime socket/control files
+- `/run/keyring-rs/unlock.sock` - Unlock socket (root-only, greetd integration)
+- `/run/user/$UID/keyring-rs/` - Runtime files (D-Bus daemon)
 
-## Open Questions
+## Unlock Mechanism (greetd Integration)
 
-1. Password prompt mechanism - portal vs custom dialog vs env var?
-2. Auto-lock on idle?
-3. Multiple collections or single "default" only?
-4. Should we support the DH session encryption?
+The keyring is unlocked at login via integration with greetd. When a user authenticates, greetd sends the password to keyring-rs before starting the user session.
+
+### Architecture
+
+```
+greetd (session worker)              keyring-rs daemon
+        │                                    │
+        │ [PAM auth succeeds]                │
+        │                                    │
+        │──── UnlockRequest { password } ───►│
+        │     via peercred-ipc               │
+        │     /run/keyring-rs/unlock.sock    │
+        │                                    │
+        │◄──── UnlockResponse ──────────────│
+        │                                    │
+        │ [start user session]               │
+        │                                    │
+```
+
+### Protocol (peercred-ipc)
+
+```rust
+// Sent by greetd after successful PAM authentication
+struct UnlockRequest {
+    user: String,      // Username being logged in
+    password: String,  // Login password (same as keyring password)
+}
+
+enum UnlockResponse {
+    Success,
+    WrongPassword,
+    NoSuchUser,
+    Error { message: String },
+}
+```
+
+### Trust Model
+
+The unlock socket only accepts connections from:
+- **UID 0 (root)** - greetd session worker runs as root during auth
+- Optionally: specific exe path whitelist (`/usr/bin/greetd`)
+
+Regular users cannot call the unlock endpoint directly.
+
+### Socket Location
+
+- `/run/keyring-rs/unlock.sock` - System-wide socket for unlock requests (root-only)
+- `/run/user/{uid}/keyring-rs/control.sock` - Per-user socket for D-Bus daemon control
+
+### Failure Handling
+
+If unlock fails (wrong password, daemon not running):
+- greetd logs warning but continues session start
+- User will be prompted via D-Bus when an app requests secrets
+- This allows login even if keyring password differs from login password
+
+### Password Synchronization
+
+The keyring password should match the login password. When user changes password:
+1. PAM `password` stack notifies keyring-rs (future: PAM module)
+2. Or: User manually updates via `keyring-ctl change-password`
+
+## Design Decisions
+
+| Question | Decision | Rationale |
+|----------|----------|-----------|
+| Password prompt | greetd integration | No PAM module needed, simpler |
+| Auto-lock on idle | No (v0.1) | Complexity; session lock is sufficient |
+| Multiple collections | Yes, with "default" | Spec compatibility |
+| DH session encryption | No (v0.1) | D-Bus is local; add later if needed |

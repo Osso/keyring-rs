@@ -40,6 +40,12 @@ pub enum KeyringError {
 
     #[error("D-Bus error: {0}")]
     DBus(#[from] zbus::Error),
+
+    #[error("IO error: {0}")]
+    Io(String),
+
+    #[error("IO error: {0}")]
+    StdIo(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, KeyringError>;
