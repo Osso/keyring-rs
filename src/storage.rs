@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::crypto::{generate_salt, Crypto};
+use crate::crypto::{Crypto, generate_salt};
 use crate::error::{KeyringError, Result};
 
 const COLLECTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("collections");
@@ -25,7 +25,7 @@ pub struct Item {
     pub id: u64,
     pub collection: String,
     pub label: String,
-    pub secret: Vec<u8>,     // encrypted
+    pub secret: Vec<u8>, // encrypted
     pub nonce: [u8; 12],
     pub created: u64,
     pub modified: u64,
@@ -36,7 +36,7 @@ pub struct DecryptedItem {
     pub id: u64,
     pub collection: String,
     pub label: String,
-    pub secret: Vec<u8>,     // plaintext
+    pub secret: Vec<u8>, // plaintext
     pub attributes: HashMap<String, String>,
     pub created: u64,
     pub modified: u64,
@@ -319,7 +319,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::open(dir.path().join("test.db")).unwrap();
 
-        storage.create_collection("test", "Test Collection").unwrap();
+        storage
+            .create_collection("test", "Test Collection")
+            .unwrap();
         let collection = storage.get_collection("test").unwrap().unwrap();
 
         assert_eq!(collection.name, "test");
@@ -358,11 +360,15 @@ mod tests {
 
         let mut attrs1 = HashMap::new();
         attrs1.insert("service".to_string(), "github.com".to_string());
-        storage.create_item("default", "GitHub", b"gh-secret", attrs1).unwrap();
+        storage
+            .create_item("default", "GitHub", b"gh-secret", attrs1)
+            .unwrap();
 
         let mut attrs2 = HashMap::new();
         attrs2.insert("service".to_string(), "gitlab.com".to_string());
-        storage.create_item("default", "GitLab", b"gl-secret", attrs2).unwrap();
+        storage
+            .create_item("default", "GitLab", b"gl-secret", attrs2)
+            .unwrap();
 
         let mut query = HashMap::new();
         query.insert("service".to_string(), "github.com".to_string());

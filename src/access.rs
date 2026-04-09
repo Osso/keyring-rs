@@ -4,11 +4,11 @@
 // Access is remembered for the lifetime of the process (by PID).
 // Uses authd for confirmation dialogs.
 
+use authd_protocol::{AuthRequest, AuthResponse, SOCKET_PATH};
+use peercred_ipc::Client;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
-use authd_protocol::{AuthRequest, AuthResponse, SOCKET_PATH};
-use peercred_ipc::Client;
 
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
@@ -129,9 +129,7 @@ fn prompt_authd_sync(caller_exe: &PathBuf, display_name: &str) -> Result<bool, A
             tracing::warn!("No authd policy for keyring access - allowing by default");
             Ok(true)
         }
-        AuthResponse::Error { message } => {
-            Err(AccessError::DialogFailed(message))
-        }
+        AuthResponse::Error { message } => Err(AccessError::DialogFailed(message)),
     }
 }
 
