@@ -11,6 +11,10 @@ const COLLECTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("collecti
 const ITEMS: TableDefinition<u64, &[u8]> = TableDefinition::new("items");
 const ATTRIBUTES: TableDefinition<(u64, &str), &str> = TableDefinition::new("attributes");
 const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+const PASSWORD_SENTINEL_CIPHERTEXT_KEY: &str = "password_sentinel_ciphertext";
+const PASSWORD_SENTINEL_NONCE_KEY: &str = "password_sentinel_nonce";
+const PASSWORD_SENTINEL_NONCE_SIZE: usize = 12;
+const PASSWORD_SENTINEL_PLAINTEXT: &[u8] = b"keyring-rs-password-sentinel-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
@@ -98,7 +102,14 @@ impl Storage {
 
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         let crypto = Crypto::from_password(password, &self.salt)?;
-        // TODO: Verify password by decrypting a test value
+        if let Some((ciphertext, nonce)) = self.load_password_sentinel()? {
+            let decrypted = crypto
+                .decrypt(&ciphertext, &nonce)
+                .map_err(|_| KeyringError::InvalidPassword)?;
+            if decrypted != PASSWORD_SENTINEL_PLAINTEXT {
+                return Err(KeyringError::InvalidPassword);
+            }
+        }
         self.crypto = Some(crypto);
         Ok(())
     }
@@ -131,6 +142,32 @@ impl Storage {
             let mut table = write_txn.open_table(COLLECTIONS)?;
             let data = serde_json::to_vec(&collection)?;
             table.insert(name, data.as_slice())?;
+
+            if let Some(crypto) = self.crypto.as_ref() {
+                let mut metadata = write_txn.open_table(METADATA)?;
+                let has_ciphertext = {
+                    let value = metadata.get(PASSWORD_SENTINEL_CIPHERTEXT_KEY)?;
+                    value.is_some()
+                };
+                let has_nonce = {
+                    let value = metadata.get(PASSWORD_SENTINEL_NONCE_KEY)?;
+                    value.is_some()
+                };
+
+                match (has_ciphertext, has_nonce) {
+                    (false, false) => {
+                        let (ciphertext, nonce) = crypto.encrypt(PASSWORD_SENTINEL_PLAINTEXT)?;
+                        metadata.insert(PASSWORD_SENTINEL_CIPHERTEXT_KEY, ciphertext.as_slice())?;
+                        metadata.insert(PASSWORD_SENTINEL_NONCE_KEY, nonce.as_slice())?;
+                    }
+                    (true, true) => {}
+                    _ => {
+                        return Err(KeyringError::Decryption(
+                            "Incomplete password sentinel metadata".to_string(),
+                        ));
+                    }
+                }
+            }
         }
         write_txn.commit()?;
 
@@ -300,6 +337,33 @@ impl Storage {
 
         Ok(removed)
     }
+
+    fn load_password_sentinel(
+        &self,
+    ) -> Result<Option<(Vec<u8>, [u8; PASSWORD_SENTINEL_NONCE_SIZE])>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(METADATA)?;
+
+        let ciphertext = table.get(PASSWORD_SENTINEL_CIPHERTEXT_KEY)?;
+        let nonce = table.get(PASSWORD_SENTINEL_NONCE_KEY)?;
+
+        match (ciphertext, nonce) {
+            (Some(ciphertext), Some(nonce)) => {
+                if nonce.value().len() != PASSWORD_SENTINEL_NONCE_SIZE {
+                    return Err(KeyringError::Decryption(
+                        "Invalid password sentinel nonce length".to_string(),
+                    ));
+                }
+                let mut nonce_bytes = [0u8; PASSWORD_SENTINEL_NONCE_SIZE];
+                nonce_bytes.copy_from_slice(nonce.value());
+                Ok(Some((ciphertext.value().to_vec(), nonce_bytes)))
+            }
+            (None, None) => Ok(None),
+            _ => Err(KeyringError::Decryption(
+                "Incomplete password sentinel metadata".to_string(),
+            )),
+        }
+    }
 }
 
 fn now_timestamp() -> u64 {
@@ -312,6 +376,7 @@ fn now_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::KeyringError;
     use std::collections::HashMap;
 
     #[test]
@@ -375,5 +440,28 @@ mod tests {
 
         let results = storage.search_items(&query).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn unlock_password_sentinel_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+
+        // Uninitialized sentinel path: no sentinel metadata yet.
+        storage.unlock("test-password").unwrap();
+        storage.lock();
+
+        // Create sentinel when creating a collection while unlocked.
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage.lock();
+
+        // Right password path.
+        storage.unlock("test-password").unwrap();
+        storage.lock();
+
+        // Wrong password path.
+        let err = storage.unlock("wrong-password").unwrap_err();
+        assert!(matches!(err, KeyringError::InvalidPassword));
     }
 }
