@@ -7,7 +7,9 @@
 use authd_protocol::{AuthRequest, AuthResponse, SOCKET_PATH};
 use peercred_ipc::Client;
 use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,8 @@ pub struct AccessControl {
     authorized: RwLock<HashMap<u32, ProcessInfo>>,
     /// Whether to prompt for access (false = auto-allow all)
     prompt_enabled: bool,
+    /// Prompt backend (authd in production; injected hook in tests)
+    prompt_authd_callback: Arc<PromptAuthdCallback>,
 }
 
 impl AccessControl {
@@ -46,6 +50,19 @@ impl AccessControl {
         Self {
             authorized: RwLock::new(HashMap::new()),
             prompt_enabled,
+            prompt_authd_callback: Arc::new(prompt_authd_sync),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_prompt(
+        prompt_enabled: bool,
+        prompt_authd_callback: impl Fn(&Path, &str) -> Result<bool, AccessError> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            authorized: RwLock::new(HashMap::new()),
+            prompt_enabled,
+            prompt_authd_callback: Arc::new(prompt_authd_callback),
         }
     }
 
@@ -83,11 +100,12 @@ impl AccessControl {
     async fn prompt_via_authd(&self, info: &ProcessInfo) -> Result<bool, AccessError> {
         let exe = info.exe.clone();
         let display_name = info.display_name();
+        let prompt_authd_callback = self.prompt_authd_callback.clone();
 
         // Use std thread since peercred-ipc Client is sync
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = prompt_authd_sync(&exe, &display_name);
+            let result = prompt_authd_callback(exe.as_path(), &display_name);
             let _ = tx.send(result);
         });
 
@@ -103,10 +121,10 @@ impl AccessControl {
 }
 
 /// Synchronous authd prompt (runs in blocking thread)
-fn prompt_authd_sync(caller_exe: &PathBuf, display_name: &str) -> Result<bool, AccessError> {
+fn prompt_authd_sync(caller_exe: &Path, display_name: &str) -> Result<bool, AccessError> {
     // Build AuthRequest with confirm_only=true
     let request = AuthRequest {
-        target: caller_exe.clone(),
+        target: caller_exe.to_path_buf(),
         args: vec![format!("access keyring ({})", display_name)],
         env: HashMap::new(),
         password: String::new(),
@@ -117,6 +135,10 @@ fn prompt_authd_sync(caller_exe: &PathBuf, display_name: &str) -> Result<bool, A
     let response: AuthResponse = Client::call(SOCKET_PATH, &request)
         .map_err(|e| AccessError::DialogFailed(format!("authd call failed: {}", e)))?;
 
+    interpret_auth_response(response)
+}
+
+fn interpret_auth_response(response: AuthResponse) -> Result<bool, AccessError> {
     match response {
         AuthResponse::Success { .. } => Ok(true),
         AuthResponse::Denied { reason } => {
@@ -139,4 +161,105 @@ pub enum AccessError {
     ProcessNotFound(u32),
     #[error("Dialog failed: {0}")]
     DialogFailed(String),
+}
+
+type PromptAuthdCallback = dyn Fn(&Path, &str) -> Result<bool, AccessError> + Send + Sync;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn check_access_uses_cached_live_authorization_without_prompt() {
+        let access = AccessControl::new_with_prompt(true, |_, _| {
+            panic!("prompt should not be called for live cache")
+        });
+        let current_pid = std::process::id();
+        let current_exe = std::env::current_exe().unwrap();
+        access.authorized.write().await.insert(
+            current_pid,
+            ProcessInfo {
+                pid: current_pid,
+                exe: current_exe,
+            },
+        );
+
+        let result = access.check_access(current_pid).await.unwrap();
+        assert!(result);
+    }
+
+    #[tokio::test]
+    async fn check_access_reprompts_when_cached_pid_is_dead() {
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls_clone = prompt_calls.clone();
+        let access = AccessControl::new_with_prompt(true, move |_, _| {
+            prompt_calls_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        });
+        let current_pid = std::process::id();
+        let current_exe = std::env::current_exe().unwrap();
+        access.authorized.write().await.insert(
+            current_pid,
+            ProcessInfo {
+                pid: 0,
+                exe: current_exe,
+            },
+        );
+
+        let result = access.check_access(current_pid).await.unwrap();
+
+        assert!(result);
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 1);
+        let authorized = access.authorized.read().await;
+        assert_eq!(authorized.get(&current_pid).unwrap().pid, current_pid);
+    }
+
+    #[tokio::test]
+    async fn prompt_via_authd_returns_hook_result_and_uses_display_name() {
+        let observed_display = Arc::new(std::sync::Mutex::new(String::new()));
+        let observed_display_clone = observed_display.clone();
+        let access = AccessControl::new_with_prompt(true, move |_, display_name| {
+            *observed_display_clone.lock().unwrap() = display_name.to_string();
+            Ok(false)
+        });
+
+        let info = ProcessInfo {
+            pid: 42,
+            exe: PathBuf::from("/tmp/sample-app"),
+        };
+        let result = access.prompt_via_authd(&info).await.unwrap();
+
+        assert!(!result);
+        assert_eq!(*observed_display.lock().unwrap(), "sample-app".to_string());
+    }
+
+    #[test]
+    fn interpret_auth_response_denied_returns_false() {
+        let result = interpret_auth_response(AuthResponse::Denied {
+            reason: "policy denied".to_string(),
+        })
+        .unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn interpret_auth_response_unknown_target_allows_access() {
+        let result = interpret_auth_response(AuthResponse::UnknownTarget).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn interpret_auth_response_error_returns_dialog_failed() {
+        let error = interpret_auth_response(AuthResponse::Error {
+            message: "backend exploded".to_string(),
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AccessError::DialogFailed(message) if message == "backend exploded"
+        ));
+    }
 }
