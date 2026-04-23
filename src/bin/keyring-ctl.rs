@@ -276,7 +276,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = read_secret_service_source(&Vec::new()).await.unwrap();
+        let snapshot = wait_for_source_snapshot(1, 1).await;
         assert_eq!(snapshot.collections.len(), 1);
         assert_eq!(snapshot.collections[0].items.len(), 1);
 
@@ -306,5 +306,41 @@ mod tests {
         assert_eq!(imported_item.label, "Imported Item");
         assert_eq!(imported_item.secret, b"imported-secret");
         assert_eq!(imported_item.attributes, attrs);
+    }
+
+    async fn wait_for_source_snapshot(
+        expected_collections: usize,
+        expected_items: usize,
+    ) -> SourceSnapshot {
+        const MAX_ATTEMPTS: usize = 50;
+        const POLL_DELAY: Duration = Duration::from_millis(50);
+        let mut last_observation = String::from("none");
+
+        for _ in 0..MAX_ATTEMPTS {
+            match read_secret_service_source(&Vec::new()).await {
+                Ok(snapshot) => {
+                    let item_count: usize =
+                        snapshot.collections.iter().map(|c| c.items.len()).sum();
+                    last_observation = format!(
+                        "snapshot collections={} items={}",
+                        snapshot.collections.len(),
+                        item_count
+                    );
+                    if snapshot.collections.len() >= expected_collections
+                        && item_count >= expected_items
+                    {
+                        return snapshot;
+                    }
+                }
+                Err(error) => {
+                    last_observation = format!("error: {error}");
+                }
+            }
+            sleep(POLL_DELAY).await;
+        }
+
+        panic!(
+            "source service did not expose expected collections and items in time (last observation: {last_observation})"
+        );
     }
 }

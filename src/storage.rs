@@ -327,6 +327,16 @@ impl Storage {
 
     pub fn search_items(&self, query: &HashMap<String, String>) -> Result<Vec<u64>> {
         let read_txn = self.db.begin_read()?;
+        if query.is_empty() {
+            let items_table = read_txn.open_table(ITEMS)?;
+            let mut all_items = Vec::new();
+            for entry in items_table.iter()? {
+                let (item_id, _) = entry?;
+                all_items.push(item_id.value());
+            }
+            return Ok(all_items);
+        }
+
         let attrs_table = read_txn.open_table(ATTRIBUTES)?;
 
         // Build a map of item_id -> matching attribute count
@@ -577,6 +587,10 @@ mod tests {
 
         let results = storage.search_items(&query).unwrap();
         assert_eq!(results.len(), 1);
+
+        let mut all_results = storage.search_items(&HashMap::new()).unwrap();
+        all_results.sort_unstable();
+        assert_eq!(all_results.len(), 2);
     }
 
     #[test]
