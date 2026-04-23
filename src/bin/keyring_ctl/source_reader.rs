@@ -12,6 +12,7 @@ const SECRET_COLLECTION_INTERFACE: &str = "org.freedesktop.Secret.Collection";
 const SECRET_ITEM_INTERFACE: &str = "org.freedesktop.Secret.Item";
 const COLLECTION_PATH_PREFIX: &str = "/org/freedesktop/secrets/collection/";
 const OPEN_SESSION_PLAIN_ALGORITHM: &str = "plain";
+const LOCKED_COLLECTION_RETRY_GUIDANCE: &str = "Unlock these collections in gnome-keyring (for example in Seahorse or via a secret-tool lookup), then retry `keyring-ctl import-gnome`.";
 
 type SecretTuple = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
@@ -63,6 +64,11 @@ pub enum SourceReaderError {
         item_path: String,
         session_path: String,
     },
+    #[error("Locked source collection(s): {collections}. {retry_guidance}")]
+    LockedSourceCollections {
+        collections: String,
+        retry_guidance: &'static str,
+    },
 }
 
 pub async fn read_secret_service_source(
@@ -107,6 +113,7 @@ impl SecretServiceSourceReader {
             skipped_locked_collections: Vec::new(),
             skipped_filtered_collections: Vec::new(),
         };
+        let mut locked_collections = Vec::new();
 
         for collection_path in collection_paths {
             let name = collection_name_for_path(collection_path.as_str());
@@ -119,7 +126,7 @@ impl SecretServiceSourceReader {
                 .interface_properties(collection_path.as_str(), SECRET_COLLECTION_INTERFACE)
                 .await?;
             if bool_property(&props, "Locked", collection_path.as_str())? {
-                snapshot.skipped_locked_collections.push(name);
+                locked_collections.push(name);
                 continue;
             }
 
@@ -132,6 +139,10 @@ impl SecretServiceSourceReader {
                 path: collection_path,
                 items,
             });
+        }
+
+        if !locked_collections.is_empty() {
+            return Err(locked_collections_error(locked_collections));
         }
 
         Ok(snapshot)
@@ -278,6 +289,16 @@ fn collection_name_for_path(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+fn locked_collections_error(collections: Vec<String>) -> SourceReaderError {
+    let mut collections = collections;
+    collections.sort();
+    collections.dedup();
+    SourceReaderError::LockedSourceCollections {
+        collections: collections.join(", "),
+        retry_guidance: LOCKED_COLLECTION_RETRY_GUIDANCE,
+    }
+}
+
 fn string_property(
     properties: &HashMap<String, OwnedValue>,
     key: &'static str,
@@ -384,5 +405,18 @@ mod tests {
         let filter = normalize_collection_filter(&["default".to_string()]);
         assert!(collection_selected("default", &filter));
         assert!(!collection_selected("login", &filter));
+    }
+
+    #[test]
+    fn locked_collection_error_is_sorted_and_has_retry_guidance() {
+        let error = locked_collections_error(vec![
+            "login".to_string(),
+            "default".to_string(),
+            "login".to_string(),
+        ]);
+        let message = error.to_string();
+
+        assert!(message.contains("default, login"));
+        assert!(message.contains("retry `keyring-ctl import-gnome`"));
     }
 }
