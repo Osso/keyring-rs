@@ -11,6 +11,7 @@ const COLLECTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("collecti
 const ITEMS: TableDefinition<u64, &[u8]> = TableDefinition::new("items");
 const ATTRIBUTES: TableDefinition<(u64, &str), &str> = TableDefinition::new("attributes");
 const METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
+const ALIAS_METADATA_KEY_PREFIX: &str = "alias:";
 const PASSWORD_SENTINEL_CIPHERTEXT_KEY: &str = "password_sentinel_ciphertext";
 const PASSWORD_SENTINEL_NONCE_KEY: &str = "password_sentinel_nonce";
 const PASSWORD_SENTINEL_NONCE_SIZE: usize = 12;
@@ -201,6 +202,38 @@ impl Storage {
         Ok(collections)
     }
 
+    pub fn get_alias(&self, alias: &str) -> Result<Option<String>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(METADATA)?;
+        let alias_key = alias_metadata_key(alias);
+
+        let value = table.get(alias_key.as_str())?;
+        match value {
+            Some(encoded) => Ok(Some(serde_json::from_slice(encoded.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_alias(&self, alias: &str, collection: Option<&str>) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        let alias_key = alias_metadata_key(alias);
+
+        {
+            let mut table = write_txn.open_table(METADATA)?;
+            match collection {
+                Some(collection) => {
+                    let encoded = serde_json::to_vec(collection)?;
+                    table.insert(alias_key.as_str(), encoded.as_slice())?;
+                }
+                None => {
+                    table.remove(alias_key.as_str())?;
+                }
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     pub fn list_item_locations(&self) -> Result<Vec<(String, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(ITEMS)?;
@@ -387,6 +420,10 @@ fn now_timestamp() -> u64 {
         .as_nanos() as u64
 }
 
+fn alias_metadata_key(alias: &str) -> String {
+    format!("{}{}", ALIAS_METADATA_KEY_PREFIX, alias)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +538,36 @@ mod tests {
         // Wrong password path.
         let err = storage.unlock("wrong-password").unwrap_err();
         assert!(matches!(err, KeyringError::InvalidPassword));
+    }
+
+    #[test]
+    fn alias_roundtrip_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = Storage::open(&db_path).unwrap();
+
+        storage.set_alias("default", Some("default")).unwrap();
+        assert_eq!(
+            storage.get_alias("default").unwrap(),
+            Some("default".to_string())
+        );
+
+        storage.set_alias("default", Some("work")).unwrap();
+        assert_eq!(
+            storage.get_alias("default").unwrap(),
+            Some("work".to_string())
+        );
+
+        storage.set_alias("default", None).unwrap();
+        assert_eq!(storage.get_alias("default").unwrap(), None);
+
+        storage.set_alias("favorite", Some("default")).unwrap();
+        drop(storage);
+
+        let reopened = Storage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_alias("favorite").unwrap(),
+            Some("default".to_string())
+        );
     }
 }

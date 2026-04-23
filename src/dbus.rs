@@ -169,16 +169,43 @@ impl SecretService {
 
     /// Read an alias (e.g., "default" collection)
     async fn read_alias(&self, name: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+        let storage: RwLockReadGuard<'_, Storage> = self.storage.read().await;
+        let stored_alias = storage
+            .get_alias(name)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        if let Some(collection_name) = stored_alias {
+            return collection_object_path(&collection_name);
+        }
+
         if name == "default" {
-            Ok(OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default").unwrap())
+            collection_object_path("default")
         } else {
-            Ok(OwnedObjectPath::try_from("/").unwrap())
+            Ok(OwnedObjectPath::try_from(ROOT_PROMPT_PATH).unwrap())
         }
     }
 
     /// Set an alias
-    async fn set_alias(&self, _name: &str, _collection: OwnedObjectPath) -> zbus::fdo::Result<()> {
-        // TODO: implement alias management
+    async fn set_alias(&self, name: &str, collection: OwnedObjectPath) -> zbus::fdo::Result<()> {
+        let collection_name = collection_name_from_path(collection.as_str())
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs("Invalid collection path".to_string()))?;
+
+        let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
+        if let Some(collection_name) = collection_name.as_deref() {
+            if storage
+                .get_collection(collection_name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .is_none()
+            {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "Collection not found: {}",
+                    collection_name
+                )));
+            }
+        }
+
+        storage
+            .set_alias(name, collection_name.as_deref())
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
 
@@ -623,6 +650,27 @@ fn item_object_path(collection: &str, id: u64) -> zbus::Result<OwnedObjectPath> 
     .map_err(|e| zbus::Error::Failure(e.to_string()))
 }
 
+fn collection_object_path(collection: &str) -> zbus::fdo::Result<OwnedObjectPath> {
+    OwnedObjectPath::try_from(format!(
+        "/org/freedesktop/secrets/collection/{}",
+        collection
+    ))
+    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+}
+
+fn collection_name_from_path(path: &str) -> Option<Option<String>> {
+    if path == ROOT_PROMPT_PATH {
+        return Some(None);
+    }
+
+    let collection_name = path.strip_prefix("/org/freedesktop/secrets/collection/")?;
+    if collection_name.is_empty() || collection_name.contains('/') {
+        return None;
+    }
+
+    Some(Some(collection_name.to_string()))
+}
+
 async fn register_item_object(
     connection: &Connection,
     storage: Arc<RwLock<Storage>>,
@@ -823,6 +871,23 @@ mod tests {
         assert_eq!(extract_prompt_password("0"), None);
     }
 
+    #[test]
+    fn collection_name_from_path_parses_valid_paths() {
+        assert_eq!(
+            collection_name_from_path("/org/freedesktop/secrets/collection/default"),
+            Some(Some("default".to_string()))
+        );
+        assert_eq!(collection_name_from_path("/"), Some(None));
+        assert_eq!(
+            collection_name_from_path("/org/freedesktop/secrets/collection/"),
+            None
+        );
+        assert_eq!(
+            collection_name_from_path("/org/freedesktop/secrets/collection/a/b"),
+            None
+        );
+    }
+
     #[tokio::test]
     #[ignore = "requires dbus-run-session"]
     async fn unlock_returns_live_prompt_path_when_locked() {
@@ -900,6 +965,49 @@ mod tests {
 
         let storage = storage.read().await;
         assert!(!storage.is_locked());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn set_alias_persists_and_read_alias_returns_collection_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage.create_collection("work", "Work").unwrap();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service_connection = start_service(storage.clone(), access).await.unwrap();
+
+        let client = Connection::session().await.unwrap();
+        let work_path =
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/work").unwrap();
+        client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "SetAlias",
+                &("test", work_path.clone()),
+            )
+            .await
+            .unwrap();
+
+        let response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "ReadAlias",
+                &("test",),
+            )
+            .await
+            .unwrap();
+        let alias_path: OwnedObjectPath = response.body().deserialize().unwrap();
+        assert_eq!(alias_path.as_str(), work_path.as_str());
+
+        let storage = storage.read().await;
+        assert_eq!(storage.get_alias("test").unwrap(), Some("work".to_string()));
     }
 
     #[tokio::test]
