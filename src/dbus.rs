@@ -185,11 +185,16 @@ impl SecretService {
 pub struct SecretCollection {
     storage: Arc<RwLock<Storage>>,
     name: String,
+    connection: Connection,
 }
 
 impl SecretCollection {
-    pub fn new(storage: Arc<RwLock<Storage>>, name: String) -> Self {
-        Self { storage, name }
+    pub fn new(storage: Arc<RwLock<Storage>>, name: String, connection: Connection) -> Self {
+        Self {
+            storage,
+            name,
+            connection,
+        }
     }
 }
 
@@ -225,41 +230,42 @@ impl SecretCollection {
         replace: bool,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
-        let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
+        let id = {
+            let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
 
-        // Extract label from properties
-        let label: String = properties
-            .get("org.freedesktop.Secret.Item.Label")
-            .and_then(|v| TryInto::<String>::try_into(v.clone()).ok())
-            .unwrap_or_else(|| "Unnamed".to_string());
+            // Extract label from properties
+            let label: String = properties
+                .get("org.freedesktop.Secret.Item.Label")
+                .and_then(|v| TryInto::<String>::try_into(v.clone()).ok())
+                .unwrap_or_else(|| "Unnamed".to_string());
 
-        // Extract attributes from properties
-        let attributes: HashMap<String, String> = properties
-            .get("org.freedesktop.Secret.Item.Attributes")
-            .and_then(|v| TryInto::<HashMap<String, String>>::try_into(v.clone()).ok())
-            .unwrap_or_default();
+            // Extract attributes from properties
+            let attributes: HashMap<String, String> = properties
+                .get("org.freedesktop.Secret.Item.Attributes")
+                .and_then(|v| TryInto::<HashMap<String, String>>::try_into(v.clone()).ok())
+                .unwrap_or_default();
 
-        // If replace is true, search for existing item with same attributes
-        if replace && !attributes.is_empty() {
-            let existing: Vec<u64> = storage
-                .search_items(&attributes)
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // If replace is true, search for existing item with same attributes
+            if replace && !attributes.is_empty() {
+                let existing: Vec<u64> = storage
+                    .search_items(&attributes)
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
-            for id in existing {
-                let _ = storage.delete_item(id);
+                for id in existing {
+                    let _ = storage.delete_item(id);
+                }
             }
-        }
 
-        // Create the item - secret.2 is the actual secret bytes
-        let id = storage
-            .create_item(&self.name, &label, &secret.2, attributes)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+            // Create the item - secret.2 is the actual secret bytes
+            storage
+                .create_item(&self.name, &label, &secret.2, attributes)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        };
 
-        let item_path = OwnedObjectPath::try_from(format!(
-            "/org/freedesktop/secrets/collection/{}/{}",
-            self.name, id
-        ))
-        .unwrap();
+        let item_path =
+            register_item_object(&self.connection, self.storage.clone(), &self.name, id)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         // No prompt needed
         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
@@ -467,24 +473,66 @@ pub async fn start_service(
         .await?;
 
     // Register default collection
-    let collection = SecretCollection::new(storage.clone(), "default".to_string());
+    let collection =
+        SecretCollection::new(storage.clone(), "default".to_string(), connection.clone());
     connection
         .object_server()
         .at("/org/freedesktop/secrets/collection/default", collection)
         .await?;
 
     // Register alias for default collection
-    let alias_collection = SecretCollection::new(storage.clone(), "default".to_string());
+    let alias_collection =
+        SecretCollection::new(storage.clone(), "default".to_string(), connection.clone());
     connection
         .object_server()
         .at("/org/freedesktop/secrets/aliases/default", alias_collection)
         .await?;
+
+    register_existing_item_objects(&connection, storage).await?;
 
     connection.request_name("org.freedesktop.secrets").await?;
 
     tracing::info!("D-Bus service started on org.freedesktop.secrets");
 
     Ok(connection)
+}
+
+fn item_object_path(collection: &str, id: u64) -> zbus::Result<OwnedObjectPath> {
+    OwnedObjectPath::try_from(format!(
+        "/org/freedesktop/secrets/collection/{}/{}",
+        collection, id
+    ))
+    .map_err(|e| zbus::Error::Failure(e.to_string()))
+}
+
+async fn register_item_object(
+    connection: &Connection,
+    storage: Arc<RwLock<Storage>>,
+    collection: &str,
+    id: u64,
+) -> zbus::Result<OwnedObjectPath> {
+    let path = item_object_path(collection, id)?;
+    let item = SecretItem::new(storage, collection.to_string(), id);
+    connection.object_server().at(path.as_str(), item).await?;
+    Ok(path)
+}
+
+async fn register_existing_item_objects(
+    connection: &Connection,
+    storage: Arc<RwLock<Storage>>,
+) -> zbus::Result<()> {
+    let item_locations = {
+        let storage_guard: RwLockReadGuard<'_, Storage> = storage.read().await;
+        storage_guard
+            .list_item_locations()
+            .map_err(|e| zbus::Error::Failure(e.to_string()))?
+    };
+
+    for (collection, id) in item_locations {
+        register_item_object(connection, storage.clone(), &collection, id).await?;
+    }
+
+    Ok(())
 }
 
 async fn caller_pid(connection: &Connection, sender: &str) -> Option<u32> {
@@ -541,4 +589,91 @@ where
         .flatten()
         .map(field)
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[tokio::test]
+    #[ignore = "requires secret-tool under isolated dbus-run-session"]
+    async fn secret_tool_store_lookup_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service_connection = start_service(storage.clone(), access).await.unwrap();
+
+        let secret = "smoke-secret";
+        let mut store = Command::new("secret-tool")
+            .args([
+                "store",
+                "--label",
+                "Smoke",
+                "service",
+                "dbus-smoke",
+                "user",
+                "alice",
+            ])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        store
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(secret.as_bytes())
+            .unwrap();
+        let store_output = store.wait_with_output().unwrap();
+        assert!(
+            store_output.status.success(),
+            "secret-tool store failed: {}",
+            String::from_utf8_lossy(&store_output.stderr)
+        );
+
+        let lookup_output = Command::new("secret-tool")
+            .args(["lookup", "service", "dbus-smoke", "user", "alice"])
+            .output()
+            .unwrap();
+        assert!(
+            lookup_output.status.success(),
+            "secret-tool lookup failed: stderr={}",
+            String::from_utf8_lossy(&lookup_output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&lookup_output.stdout).trim(),
+            secret
+        );
+
+        let item_path = {
+            let storage = storage.read().await;
+            let locations = storage.list_item_locations().unwrap();
+            let (collection, id) = locations
+                .into_iter()
+                .find(|(collection, _)| collection == "default")
+                .unwrap();
+            item_object_path(&collection, id).unwrap()
+        };
+
+        let client = Connection::session().await.unwrap();
+        let response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                item_path.as_str(),
+                Some("org.freedesktop.Secret.Item"),
+                "GetSecret",
+                &(OwnedObjectPath::try_from("/").unwrap(),),
+            )
+            .await
+            .unwrap();
+        let (_session, _params, secret_bytes, _content_type): Secret =
+            response.body().deserialize().unwrap();
+        assert_eq!(secret_bytes, secret.as_bytes());
+    }
 }

@@ -201,6 +201,20 @@ impl Storage {
         Ok(collections)
     }
 
+    pub fn list_item_locations(&self) -> Result<Vec<(String, u64)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(ITEMS)?;
+
+        let mut item_locations = Vec::new();
+        for entry in table.iter()? {
+            let (_, data_guard) = entry?;
+            let item: Item = serde_json::from_slice(data_guard.value())?;
+            item_locations.push((item.collection, item.id));
+        }
+
+        Ok(item_locations)
+    }
+
     // Item operations
 
     pub fn create_item(
@@ -440,6 +454,30 @@ mod tests {
 
         let results = storage.search_items(&query).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn list_item_locations_returns_collection_and_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage.create_collection("work", "Work").unwrap();
+
+        let default_id = storage
+            .create_item("default", "Default Item", b"default-secret", HashMap::new())
+            .unwrap();
+        let work_id = storage
+            .create_item("work", "Work Item", b"work-secret", HashMap::new())
+            .unwrap();
+
+        let mut locations = storage.list_item_locations().unwrap();
+        locations.sort_by_key(|(_, id)| *id);
+
+        assert_eq!(locations.len(), 2);
+        assert!(locations.contains(&("default".to_string(), default_id)));
+        assert!(locations.contains(&("work".to_string(), work_id)));
     }
 
     #[test]
