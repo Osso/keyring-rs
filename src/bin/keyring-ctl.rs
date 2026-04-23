@@ -11,7 +11,7 @@ mod storage;
 
 use clap::{Args, Parser, Subcommand};
 use destination_import::{
-    DestinationImportError, ImportSummary, import_snapshot_into_default_storage,
+    CollisionPolicy, DestinationImportError, ImportSummary, import_snapshot_into_default_storage,
 };
 use source_reader::{SourceSnapshot, read_secret_service_source};
 use thiserror::Error;
@@ -42,20 +42,10 @@ struct ImportGnomeArgs {
     /// Restrict import to one or more source collections (repeatable).
     #[arg(long = "collection", value_name = "NAME")]
     collections: Vec<String>,
-}
 
-async fn run_import_gnome(args: &ImportGnomeArgs) -> Result<(), ImportGnomeError> {
-    let snapshot = read_secret_service_source(&args.collections).await?;
-    let import_summary = if args.dry_run {
-        None
-    } else {
-        Some(
-            import_snapshot_into_default_storage(&snapshot)
-                .map_err(ImportGnomeError::Destination)?,
-        )
-    };
-    print_source_snapshot(&snapshot, args, import_summary.as_ref());
-    Ok(())
+    /// Policy when an item with the same label+attributes already exists.
+    #[arg(long = "on-collision", value_enum, default_value_t = CollisionPolicy::Skip)]
+    on_collision: CollisionPolicy,
 }
 
 #[derive(Debug, Error)]
@@ -64,6 +54,21 @@ enum ImportGnomeError {
     Source(#[from] source_reader::SourceReaderError),
     #[error("{0}")]
     Destination(#[from] DestinationImportError),
+}
+
+async fn run_import_gnome(args: &ImportGnomeArgs) -> Result<(), ImportGnomeError> {
+    let snapshot = read_secret_service_source(&args.collections).await?;
+    let import_summary = if args.dry_run {
+        None
+    } else {
+        Some(import_snapshot_into_default_storage(
+            &snapshot,
+            args.on_collision,
+        )?)
+    };
+
+    print_source_snapshot(&snapshot, args, import_summary.as_ref());
+    Ok(())
 }
 
 fn print_source_snapshot(
@@ -108,8 +113,10 @@ fn print_source_snapshot(
             "Imported: {} new collection(s), {} existing collection(s), {} item(s)",
             summary.collections_created, summary.collections_existing, summary.items_created
         );
-    } else if !args.dry_run {
-        println!("No destination writes were performed.");
+        println!(
+            "Collisions: {} skipped, {} replaced, {} renamed",
+            summary.items_skipped, summary.items_replaced, summary.items_renamed
+        );
     }
 }
 
@@ -142,6 +149,7 @@ mod tests {
         let args = parse_import(&["keyring-ctl", "import-gnome"]);
         assert!(!args.dry_run);
         assert!(args.collections.is_empty());
+        assert_eq!(args.on_collision, CollisionPolicy::Skip);
     }
 
     #[test]
@@ -162,6 +170,12 @@ mod tests {
             "login",
         ]);
         assert_eq!(args.collections, vec!["default", "login"]);
+    }
+
+    #[test]
+    fn import_gnome_accepts_collision_policy_flag() {
+        let args = parse_import(&["keyring-ctl", "import-gnome", "--on-collision", "rename"]);
+        assert_eq!(args.on_collision, CollisionPolicy::Rename);
     }
 
     #[test]
@@ -191,6 +205,7 @@ mod tests {
         let args = ImportGnomeArgs {
             dry_run: true,
             collections: vec![],
+            on_collision: CollisionPolicy::Skip,
         };
 
         print_source_snapshot(&snapshot, &args, None);
