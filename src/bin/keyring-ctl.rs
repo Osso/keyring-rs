@@ -1,4 +1,8 @@
+#[path = "keyring_ctl/source_reader.rs"]
+mod source_reader;
+
 use clap::{Args, Parser, Subcommand};
+use source_reader::{SourceReaderError, SourceSnapshot, read_secret_service_source};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,21 +32,60 @@ struct ImportGnomeArgs {
     collections: Vec<String>,
 }
 
-fn run_import_gnome(args: &ImportGnomeArgs) {
-    let mode = if args.dry_run { "dry-run" } else { "apply" };
-    let target = if args.collections.is_empty() {
-        "all collections".to_string()
-    } else {
-        format!("collections: {}", args.collections.join(", "))
-    };
-
-    println!("import-gnome command wired ({mode}; {target}); implementation pending");
+async fn run_import_gnome(args: &ImportGnomeArgs) -> Result<(), SourceReaderError> {
+    let snapshot = read_secret_service_source(&args.collections).await?;
+    print_source_snapshot(&snapshot, args);
+    Ok(())
 }
 
-fn main() {
+fn print_source_snapshot(snapshot: &SourceSnapshot, args: &ImportGnomeArgs) {
+    let total_items: usize = snapshot.collections.iter().map(|c| c.items.len()).sum();
+    let mode = if args.dry_run { "dry-run" } else { "apply" };
+    println!(
+        "Source read complete ({mode}): {} unlocked collection(s), {} item(s)",
+        snapshot.collections.len(),
+        total_items
+    );
+
+    for collection in &snapshot.collections {
+        println!(
+            "- {} ({}) [{}] {} item(s)",
+            collection.name,
+            collection.label,
+            collection.path.as_str(),
+            collection.items.len()
+        );
+    }
+
+    if !snapshot.skipped_locked_collections.is_empty() {
+        println!(
+            "Skipped locked collections: {}",
+            snapshot.skipped_locked_collections.join(", ")
+        );
+    }
+
+    if !snapshot.skipped_filtered_collections.is_empty() {
+        println!(
+            "Skipped by --collection filter: {}",
+            snapshot.skipped_filtered_collections.join(", ")
+        );
+    }
+
+    if !args.dry_run {
+        println!("Destination import not implemented yet; source reader is now active.");
+    }
+}
+
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-    match cli.command {
-        Commands::ImportGnome(args) => run_import_gnome(&args),
+    let result = match cli.command {
+        Commands::ImportGnome(args) => run_import_gnome(&args).await,
+    };
+
+    if let Err(error) = result {
+        eprintln!("import-gnome failed: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -82,5 +125,37 @@ mod tests {
             "login",
         ]);
         assert_eq!(args.collections, vec!["default", "login"]);
+    }
+
+    #[test]
+    fn print_source_snapshot_shows_collection_counts() {
+        let snapshot = SourceSnapshot {
+            collections: vec![source_reader::SourceCollection {
+                name: "default".to_string(),
+                label: "Default".to_string(),
+                path: zbus::zvariant::OwnedObjectPath::try_from(
+                    "/org/freedesktop/secrets/collection/default",
+                )
+                .unwrap(),
+                items: vec![source_reader::SourceItem {
+                    path: zbus::zvariant::OwnedObjectPath::try_from(
+                        "/org/freedesktop/secrets/collection/default/1",
+                    )
+                    .unwrap(),
+                    label: "Item".to_string(),
+                    attributes: std::collections::HashMap::new(),
+                    secret: b"secret".to_vec(),
+                    content_type: "text/plain".to_string(),
+                }],
+            }],
+            skipped_locked_collections: vec!["login".to_string()],
+            skipped_filtered_collections: vec![],
+        };
+        let args = ImportGnomeArgs {
+            dry_run: true,
+            collections: vec![],
+        };
+
+        print_source_snapshot(&snapshot, &args);
     }
 }
