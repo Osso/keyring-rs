@@ -177,6 +177,28 @@ If keyring wasn't unlocked at login (different password, daemon wasn't running):
 - `/run/keyring-rs/unlock.sock` - Unlock socket (root-only, greetd integration)
 - `/run/user/$UID/keyring-rs/` - Runtime files (D-Bus daemon)
 
+## systemd User Activation
+
+User units are shipped under `contrib/systemd/`:
+
+- `keyring-daemon.service` - D-Bus user service (`BusName=org.freedesktop.secrets`)
+- `keyring-daemon.socket` - socket activation trigger on `%t/keyring.sock`
+
+Install and enable:
+
+```bash
+install -Dm0644 contrib/systemd/keyring-daemon.service ~/.config/systemd/user/keyring-daemon.service
+install -Dm0644 contrib/systemd/keyring-daemon.socket ~/.config/systemd/user/keyring-daemon.socket
+systemctl --user daemon-reload
+systemctl --user enable --now keyring-daemon.socket
+```
+
+Optional immediate start without waiting for first socket/D-Bus activation:
+
+```bash
+systemctl --user start keyring-daemon.service
+```
+
 ## Unlock Mechanism (greetd Integration)
 
 The keyring is unlocked at login via integration with greetd. When a user authenticates, greetd sends the password to keyring-rs before starting the user session.

@@ -1,0 +1,17 @@
+[Unit]
+Description=keyring-rs Secret Service daemon
+Documentation=https://specifications.freedesktop.org/secret-service/latest/
+After=graphical-session-pre.target
+Wants=graphical-session-pre.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.secrets
+ExecStart=/usr/bin/keyring-daemon
+Restart=on-failure
+RestartSec=1s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
+Also=keyring-daemon.socket

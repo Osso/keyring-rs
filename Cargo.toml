@@ -17,7 +17,7 @@ chacha20poly1305 = "0.10"
 argon2 = "0.5"
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

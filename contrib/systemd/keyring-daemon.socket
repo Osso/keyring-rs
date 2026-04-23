@@ -1,0 +1,13 @@
+[Unit]
+Description=keyring-rs activation socket
+
+[Socket]
+ListenStream=%t/keyring.sock
+SocketMode=0600
+DirectoryMode=0700
+Service=keyring-daemon.service
+FileDescriptorName=keyring
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target
