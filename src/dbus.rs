@@ -240,18 +240,8 @@ impl SecretService {
     /// Collections property
     #[zbus(property)]
     async fn collections(&self) -> Vec<OwnedObjectPath> {
-        let storage: RwLockReadGuard<'_, Storage> = self.storage.read().await;
-        let collections: Vec<crate::storage::Collection> = match storage.list_collections() {
-            Ok(c) => c,
-            Err(_) => return vec![],
-        };
-        collections
-            .iter()
-            .map(|c| {
-                OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{}", c.name))
-                    .unwrap()
-            })
-            .collect()
+        let collections = load_collections(&self.storage).await;
+        collection_paths(&collections)
     }
 }
 
@@ -809,6 +799,18 @@ fn extract_item_properties(
     (label, attributes)
 }
 
+async fn load_collections(storage: &Arc<RwLock<Storage>>) -> Vec<crate::storage::Collection> {
+    let storage: RwLockReadGuard<'_, Storage> = storage.read().await;
+    storage.list_collections().unwrap_or_default()
+}
+
+fn collection_paths(collections: &[crate::storage::Collection]) -> Vec<OwnedObjectPath> {
+    collections
+        .iter()
+        .filter_map(|collection| collection_object_path(&collection.name).ok())
+        .collect()
+}
+
 fn item_id_from_object_path(path: &OwnedObjectPath) -> Option<u64> {
     path.as_str().rsplit('/').next()?.parse::<u64>().ok()
 }
@@ -1326,6 +1328,31 @@ mod tests {
         assert_eq!(
             collection_name_from_path("/org/freedesktop/secrets/collection/a/b"),
             None
+        );
+    }
+
+    #[test]
+    fn collection_paths_skip_invalid_collection_names() {
+        let collections = vec![
+            crate::storage::Collection {
+                name: "default".to_string(),
+                label: "Default".to_string(),
+                created: 1,
+                modified: 1,
+            },
+            crate::storage::Collection {
+                name: "bad name".to_string(),
+                label: "Broken".to_string(),
+                created: 2,
+                modified: 2,
+            },
+        ];
+
+        let paths = collection_paths(&collections);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].as_str(),
+            "/org/freedesktop/secrets/collection/default"
         );
     }
 
