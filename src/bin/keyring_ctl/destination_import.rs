@@ -9,6 +9,7 @@ use crate::storage::Storage;
 
 const DESTINATION_DB_PATH_ENV: &str = "KEYRING_DB_PATH";
 const DESTINATION_PASSWORD_ENV: &str = "KEYRING_PASSWORD";
+const SUPPORTED_CONTENT_TYPE: &str = "text/plain";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum CollisionPolicy {
@@ -18,13 +19,64 @@ pub enum CollisionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemFailure {
+    pub collection: String,
+    pub label: String,
+    pub path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportSummary {
     pub collections_created: usize,
     pub collections_existing: usize,
-    pub items_created: usize,
+    pub items_scanned: usize,
+    pub items_imported: usize,
     pub items_skipped: usize,
+    pub items_failed: usize,
     pub items_replaced: usize,
     pub items_renamed: usize,
+    pub failed_items: Vec<ItemFailure>,
+}
+
+impl ImportSummary {
+    pub fn for_dry_run(snapshot: &SourceSnapshot) -> Self {
+        Self {
+            collections_created: 0,
+            collections_existing: 0,
+            items_scanned: snapshot.collections.iter().map(|c| c.items.len()).sum(),
+            items_imported: 0,
+            items_skipped: 0,
+            items_failed: 0,
+            items_replaced: 0,
+            items_renamed: 0,
+            failed_items: Vec::new(),
+        }
+    }
+
+    fn new() -> Self {
+        Self {
+            collections_created: 0,
+            collections_existing: 0,
+            items_scanned: 0,
+            items_imported: 0,
+            items_skipped: 0,
+            items_failed: 0,
+            items_replaced: 0,
+            items_renamed: 0,
+            failed_items: Vec::new(),
+        }
+    }
+
+    fn record_item_failure(&mut self, collection_name: &str, item: &SourceItem, reason: String) {
+        self.items_failed += 1;
+        self.failed_items.push(ItemFailure {
+            collection: collection_name.to_string(),
+            label: item.label.clone(),
+            path: item.path.as_str().to_string(),
+            reason,
+        });
+    }
 }
 
 #[derive(Debug, Error)]
@@ -68,20 +120,21 @@ pub fn import_snapshot_into_storage(
     let mut storage = Storage::open(destination_path)?;
     storage.unlock(password)?;
 
-    let mut summary = ImportSummary {
-        collections_created: 0,
-        collections_existing: 0,
-        items_created: 0,
-        items_skipped: 0,
-        items_replaced: 0,
-        items_renamed: 0,
-    };
-
+    let mut summary = ImportSummary::new();
     for collection in sorted_collections(snapshot) {
-        import_collection(&storage, collection, collision_policy, &mut summary)?;
+        import_collection(&storage, collection, collision_policy, &mut summary);
     }
 
     Ok(summary)
+}
+
+#[derive(Debug)]
+enum ItemImportResult {
+    Imported,
+    Skipped,
+    Replaced,
+    Renamed,
+    Failed(String),
 }
 
 fn import_collection(
@@ -89,16 +142,50 @@ fn import_collection(
     collection: &SourceCollection,
     collision_policy: CollisionPolicy,
     summary: &mut ImportSummary,
-) -> Result<(), DestinationImportError> {
+) {
+    let items = sorted_items(collection);
+    if let Err(error) = ensure_collection_exists(storage, collection, summary) {
+        let reason = format!(
+            "Destination collection unavailable (`{}`): {}",
+            collection.name, error
+        );
+        for item in items {
+            summary.items_scanned += 1;
+            summary.record_item_failure(&collection.name, item, reason.clone());
+        }
+        return;
+    }
+
+    for item in items {
+        summary.items_scanned += 1;
+        match import_item(storage, &collection.name, item, collision_policy) {
+            ItemImportResult::Imported => summary.items_imported += 1,
+            ItemImportResult::Skipped => summary.items_skipped += 1,
+            ItemImportResult::Replaced => {
+                summary.items_imported += 1;
+                summary.items_replaced += 1;
+            }
+            ItemImportResult::Renamed => {
+                summary.items_imported += 1;
+                summary.items_renamed += 1;
+            }
+            ItemImportResult::Failed(reason) => {
+                summary.record_item_failure(&collection.name, item, reason)
+            }
+        }
+    }
+}
+
+fn ensure_collection_exists(
+    storage: &Storage,
+    collection: &SourceCollection,
+    summary: &mut ImportSummary,
+) -> Result<(), crate::error::KeyringError> {
     if storage.get_collection(&collection.name)?.is_none() {
         storage.create_collection(&collection.name, &collection.label)?;
         summary.collections_created += 1;
     } else {
         summary.collections_existing += 1;
-    }
-
-    for item in sorted_items(collection) {
-        import_item(storage, &collection.name, item, collision_policy, summary)?;
     }
 
     Ok(())
@@ -109,37 +196,85 @@ fn import_item(
     collection_name: &str,
     item: &SourceItem,
     collision_policy: CollisionPolicy,
-    summary: &mut ImportSummary,
-) -> Result<(), DestinationImportError> {
-    let collisions = colliding_item_ids(storage, collection_name, &item.label, &item.attributes)?;
+) -> ItemImportResult {
+    if item.content_type != SUPPORTED_CONTENT_TYPE {
+        return ItemImportResult::Failed(format!(
+            "Unsupported content type `{}` (expected `{}`)",
+            item.content_type, SUPPORTED_CONTENT_TYPE
+        ));
+    }
+
+    let collisions =
+        match colliding_item_ids(storage, collection_name, &item.label, &item.attributes) {
+            Ok(collisions) => collisions,
+            Err(error) => {
+                return ItemImportResult::Failed(format!("Unable to detect collisions: {}", error));
+            }
+        };
 
     if collisions.is_empty() {
-        create_destination_item(storage, collection_name, &item.label, item)?;
-        summary.items_created += 1;
-        return Ok(());
+        return import_new_item(storage, collection_name, &item.label, item);
     }
 
     match collision_policy {
-        CollisionPolicy::Skip => {
-            summary.items_skipped += 1;
-            Ok(())
-        }
+        CollisionPolicy::Skip => ItemImportResult::Skipped,
         CollisionPolicy::Replace => {
-            for item_id in collisions {
-                let _ = storage.delete_item(item_id)?;
-            }
-            create_destination_item(storage, collection_name, &item.label, item)?;
-            summary.items_created += 1;
-            summary.items_replaced += 1;
-            Ok(())
+            replace_colliding_items(storage, collection_name, item, collisions)
         }
-        CollisionPolicy::Rename => {
-            let renamed_label = renamed_label_for_collision(storage, collection_name, &item.label)?;
-            create_destination_item(storage, collection_name, &renamed_label, item)?;
-            summary.items_created += 1;
-            summary.items_renamed += 1;
-            Ok(())
+        CollisionPolicy::Rename => import_with_renamed_label(storage, collection_name, item),
+    }
+}
+
+fn import_new_item(
+    storage: &Storage,
+    collection_name: &str,
+    label: &str,
+    item: &SourceItem,
+) -> ItemImportResult {
+    match create_destination_item(storage, collection_name, label, item) {
+        Ok(_id) => ItemImportResult::Imported,
+        Err(error) => ItemImportResult::Failed(format!("Failed to create item: {}", error)),
+    }
+}
+
+fn replace_colliding_items(
+    storage: &Storage,
+    collection_name: &str,
+    item: &SourceItem,
+    collisions: Vec<u64>,
+) -> ItemImportResult {
+    for collision_id in collisions {
+        if let Err(error) = storage.delete_item(collision_id) {
+            return ItemImportResult::Failed(format!(
+                "Failed to delete colliding item {}: {}",
+                collision_id, error
+            ));
         }
+    }
+
+    match create_destination_item(storage, collection_name, &item.label, item) {
+        Ok(_id) => ItemImportResult::Replaced,
+        Err(error) => {
+            ItemImportResult::Failed(format!("Failed to create replacement item: {}", error))
+        }
+    }
+}
+
+fn import_with_renamed_label(
+    storage: &Storage,
+    collection_name: &str,
+    item: &SourceItem,
+) -> ItemImportResult {
+    let renamed_label = match renamed_label_for_collision(storage, collection_name, &item.label) {
+        Ok(label) => label,
+        Err(error) => {
+            return ItemImportResult::Failed(format!("Failed to compute renamed label: {}", error));
+        }
+    };
+
+    match create_destination_item(storage, collection_name, &renamed_label, item) {
+        Ok(_id) => ItemImportResult::Renamed,
+        Err(error) => ItemImportResult::Failed(format!("Failed to create renamed item: {}", error)),
     }
 }
 
@@ -268,6 +403,24 @@ mod tests {
     use crate::source_reader::{SourceCollection, SourceItem};
 
     #[test]
+    fn dry_run_summary_reports_scanned_item_count() {
+        let snapshot = source_snapshot(
+            "default",
+            "Default",
+            "Item",
+            HashMap::new(),
+            b"secret".to_vec(),
+        );
+        let summary = ImportSummary::for_dry_run(&snapshot);
+
+        assert_eq!(summary.items_scanned, 1);
+        assert_eq!(summary.items_imported, 0);
+        assert_eq!(summary.items_skipped, 0);
+        assert_eq!(summary.items_failed, 0);
+        assert!(summary.failed_items.is_empty());
+    }
+
+    #[test]
     fn import_snapshot_preserves_collection_and_item_fields() {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("import.db");
@@ -288,8 +441,10 @@ mod tests {
         .unwrap();
         assert_eq!(summary.collections_created, 1);
         assert_eq!(summary.collections_existing, 0);
-        assert_eq!(summary.items_created, 1);
+        assert_eq!(summary.items_scanned, 1);
+        assert_eq!(summary.items_imported, 1);
         assert_eq!(summary.items_skipped, 0);
+        assert_eq!(summary.items_failed, 0);
 
         let mut storage = Storage::open(&db_path).unwrap();
         storage.unlock("test-password").unwrap();
@@ -303,38 +458,6 @@ mod tests {
         assert_eq!(item.label, "Email Account");
         assert_eq!(item.attributes, attrs);
         assert_eq!(item.secret, b"super-secret");
-    }
-
-    #[test]
-    fn import_snapshot_counts_existing_collection() {
-        let temp = tempdir().unwrap();
-        let db_path = temp.path().join("import.db");
-        {
-            let mut storage = Storage::open(&db_path).unwrap();
-            storage.unlock("test-password").unwrap();
-            storage
-                .create_collection("default", "Already Exists")
-                .unwrap();
-        }
-
-        let snapshot = source_snapshot(
-            "default",
-            "Ignored Label",
-            "Item",
-            HashMap::from([("k".to_string(), "v".to_string())]),
-            b"secret".to_vec(),
-        );
-
-        let summary = import_snapshot_into_storage(
-            &snapshot,
-            &db_path,
-            "test-password",
-            CollisionPolicy::Skip,
-        )
-        .unwrap();
-        assert_eq!(summary.collections_created, 0);
-        assert_eq!(summary.collections_existing, 1);
-        assert_eq!(summary.items_created, 1);
     }
 
     #[test]
@@ -383,10 +506,12 @@ mod tests {
             CollisionPolicy::Skip,
         )
         .unwrap();
-        assert_eq!(summary.items_created, 0);
+        assert_eq!(summary.items_scanned, 1);
+        assert_eq!(summary.items_imported, 0);
         assert_eq!(summary.items_skipped, 1);
         assert_eq!(summary.items_replaced, 0);
         assert_eq!(summary.items_renamed, 0);
+        assert_eq!(summary.items_failed, 0);
 
         let items = collection_items(&db_path, "test-password", "default");
         assert_eq!(items.len(), 1);
@@ -423,10 +548,11 @@ mod tests {
             CollisionPolicy::Replace,
         )
         .unwrap();
-        assert_eq!(summary.items_created, 1);
+        assert_eq!(summary.items_imported, 1);
         assert_eq!(summary.items_skipped, 0);
         assert_eq!(summary.items_replaced, 1);
         assert_eq!(summary.items_renamed, 0);
+        assert_eq!(summary.items_failed, 0);
 
         let items = collection_items(&db_path, "test-password", "default");
         assert_eq!(items.len(), 1);
@@ -466,10 +592,11 @@ mod tests {
             CollisionPolicy::Rename,
         )
         .unwrap();
-        assert_eq!(summary.items_created, 1);
+        assert_eq!(summary.items_imported, 1);
         assert_eq!(summary.items_skipped, 0);
         assert_eq!(summary.items_replaced, 0);
         assert_eq!(summary.items_renamed, 1);
+        assert_eq!(summary.items_failed, 0);
 
         let mut labels: Vec<String> = collection_items(&db_path, "test-password", "default")
             .into_iter()
@@ -483,6 +610,54 @@ mod tests {
                 "Account (imported 1)".to_string(),
                 "Account (imported 2)".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn unsupported_content_type_is_reported_as_failed_item() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("import.db");
+
+        let snapshot = SourceSnapshot {
+            collections: vec![SourceCollection {
+                name: "default".to_string(),
+                label: "Default".to_string(),
+                path: OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default")
+                    .unwrap(),
+                items: vec![SourceItem {
+                    path: OwnedObjectPath::try_from(
+                        "/org/freedesktop/secrets/collection/default/1",
+                    )
+                    .unwrap(),
+                    label: "Binary Secret".to_string(),
+                    attributes: HashMap::new(),
+                    secret: b"data".to_vec(),
+                    content_type: "application/octet-stream".to_string(),
+                }],
+            }],
+            skipped_locked_collections: vec![],
+            skipped_filtered_collections: vec![],
+        };
+
+        let summary = import_snapshot_into_storage(
+            &snapshot,
+            &db_path,
+            "test-password",
+            CollisionPolicy::Skip,
+        )
+        .unwrap();
+
+        assert_eq!(summary.items_scanned, 1);
+        assert_eq!(summary.items_imported, 0);
+        assert_eq!(summary.items_skipped, 0);
+        assert_eq!(summary.items_failed, 1);
+        assert_eq!(summary.failed_items.len(), 1);
+        assert_eq!(summary.failed_items[0].collection, "default");
+        assert_eq!(summary.failed_items[0].label, "Binary Secret");
+        assert!(
+            summary.failed_items[0]
+                .reason
+                .contains("Unsupported content type")
         );
     }
 

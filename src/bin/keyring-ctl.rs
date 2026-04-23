@@ -59,22 +59,19 @@ enum ImportGnomeError {
 async fn run_import_gnome(args: &ImportGnomeArgs) -> Result<(), ImportGnomeError> {
     let snapshot = read_secret_service_source(&args.collections).await?;
     let import_summary = if args.dry_run {
-        None
+        ImportSummary::for_dry_run(&snapshot)
     } else {
-        Some(import_snapshot_into_default_storage(
-            &snapshot,
-            args.on_collision,
-        )?)
+        import_snapshot_into_default_storage(&snapshot, args.on_collision)?
     };
 
-    print_source_snapshot(&snapshot, args, import_summary.as_ref());
+    print_source_snapshot(&snapshot, args, &import_summary);
     Ok(())
 }
 
 fn print_source_snapshot(
     snapshot: &SourceSnapshot,
     args: &ImportGnomeArgs,
-    import_summary: Option<&ImportSummary>,
+    import_summary: &ImportSummary,
 ) {
     let total_items: usize = snapshot.collections.iter().map(|c| c.items.len()).sum();
     let mode = if args.dry_run { "dry-run" } else { "apply" };
@@ -84,6 +81,12 @@ fn print_source_snapshot(
         total_items
     );
 
+    print_collection_summary(snapshot);
+    print_snapshot_filters(snapshot);
+    print_migration_audit(import_summary);
+}
+
+fn print_collection_summary(snapshot: &SourceSnapshot) {
     for collection in &snapshot.collections {
         println!(
             "- {} ({}) [{}] {} item(s)",
@@ -93,7 +96,9 @@ fn print_source_snapshot(
             collection.items.len()
         );
     }
+}
 
+fn print_snapshot_filters(snapshot: &SourceSnapshot) {
     if !snapshot.skipped_locked_collections.is_empty() {
         println!(
             "Skipped locked collections: {}",
@@ -107,16 +112,32 @@ fn print_source_snapshot(
             snapshot.skipped_filtered_collections.join(", ")
         );
     }
+}
 
-    if let Some(summary) = import_summary {
-        println!(
-            "Imported: {} new collection(s), {} existing collection(s), {} item(s)",
-            summary.collections_created, summary.collections_existing, summary.items_created
-        );
-        println!(
-            "Collisions: {} skipped, {} replaced, {} renamed",
-            summary.items_skipped, summary.items_replaced, summary.items_renamed
-        );
+fn print_migration_audit(import_summary: &ImportSummary) {
+    println!(
+        "Imported: {} new collection(s), {} existing collection(s)",
+        import_summary.collections_created, import_summary.collections_existing
+    );
+    println!(
+        "Migration audit: scanned={}, imported={}, skipped={}, failed={}",
+        import_summary.items_scanned,
+        import_summary.items_imported,
+        import_summary.items_skipped,
+        import_summary.items_failed
+    );
+    println!(
+        "Collision outcomes: replaced={}, renamed={}",
+        import_summary.items_replaced, import_summary.items_renamed
+    );
+    if !import_summary.failed_items.is_empty() {
+        println!("Failure details:");
+        for failure in &import_summary.failed_items {
+            println!(
+                "- [{}/{}] {}: {}",
+                failure.collection, failure.label, failure.path, failure.reason
+            );
+        }
     }
 }
 
@@ -208,6 +229,7 @@ mod tests {
             on_collision: CollisionPolicy::Skip,
         };
 
-        print_source_snapshot(&snapshot, &args, None);
+        let summary = ImportSummary::for_dry_run(&snapshot);
+        print_source_snapshot(&snapshot, &args, &summary);
     }
 }
