@@ -302,45 +302,21 @@ impl SecretCollection {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
         let decoded_secret = decode_secret_for_storage(&self.sessions, &secret).await?;
-
-        let id = {
-            let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
-            let (label, attributes) = extract_item_properties(&properties);
-
-            // If replace is true, search for existing item with same attributes
-            if replace && !attributes.is_empty() {
-                let existing: Vec<u64> = storage
-                    .search_items(&attributes)
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-                for id in existing {
-                    let _ = storage.delete_item(id);
-                }
-            }
-
-            // Create the item with decoded secret bytes
-            storage
-                .create_item(&self.name, &label, &decoded_secret, attributes)
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-        };
-
-        let item_path = register_item_object(
-            &self.connection,
-            self.storage.clone(),
-            self.sessions.clone(),
+        let (label, attributes) = extract_item_properties(&properties);
+        let id = create_or_replace_collection_item(
+            &self.storage,
             &self.name,
-            id,
+            &label,
+            attributes,
+            replace,
+            &decoded_secret,
         )
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        .await?;
+        let item_path = register_collection_item_path(self, id).await?;
 
-        // No prompt needed
-        let prompt_path = OwnedObjectPath::try_from("/").unwrap();
-
-        // Signal that item was created
+        // No prompt needed and best-effort signal.
         Self::item_created(&ctxt, item_path.clone()).await.ok();
-
-        Ok((item_path, prompt_path))
+        Ok((item_path, root_prompt_path()))
     }
 
     /// Delete this collection
@@ -797,6 +773,57 @@ fn extract_item_properties(
         .and_then(|v| TryInto::<HashMap<String, String>>::try_into(v.clone()).ok())
         .unwrap_or_default();
     (label, attributes)
+}
+
+async fn create_or_replace_collection_item(
+    storage: &Arc<RwLock<Storage>>,
+    collection_name: &str,
+    label: &str,
+    attributes: HashMap<String, String>,
+    replace: bool,
+    decoded_secret: &[u8],
+) -> zbus::fdo::Result<u64> {
+    let storage: RwLockWriteGuard<'_, Storage> = storage.write().await;
+    if replace && !attributes.is_empty() {
+        delete_matching_items(&storage, &attributes)?;
+    }
+
+    storage
+        .create_item(collection_name, label, decoded_secret, attributes)
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+}
+
+fn delete_matching_items(
+    storage: &Storage,
+    attributes: &HashMap<String, String>,
+) -> zbus::fdo::Result<()> {
+    let existing: Vec<u64> = storage
+        .search_items(attributes)
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+    for id in existing {
+        let _ = storage.delete_item(id);
+    }
+    Ok(())
+}
+
+async fn register_collection_item_path(
+    collection: &SecretCollection,
+    id: u64,
+) -> zbus::fdo::Result<OwnedObjectPath> {
+    register_item_object(
+        &collection.connection,
+        collection.storage.clone(),
+        collection.sessions.clone(),
+        &collection.name,
+        id,
+    )
+    .await
+    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+}
+
+fn root_prompt_path() -> OwnedObjectPath {
+    OwnedObjectPath::try_from(ROOT_PROMPT_PATH).unwrap()
 }
 
 async fn load_collections(storage: &Arc<RwLock<Storage>>) -> Vec<crate::storage::Collection> {
