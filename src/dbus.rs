@@ -1,8 +1,14 @@
 // D-Bus Secret Service implementation
 // https://specifications.freedesktop.org/secret-service/latest/
 
+use authd_protocol::{
+    AuthRequest, AuthResponse, SOCKET_PATH as AUTHD_SOCKET_PATH, collect_wayland_env,
+};
+use peercred_ipc::Client as IpcClient;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -13,6 +19,8 @@ use crate::storage::Storage;
 
 // Secret struct as per D-Bus spec: (session, parameters, value, content_type)
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
+const ROOT_PROMPT_PATH: &str = "/";
+const PROMPT_PATH_PREFIX: &str = "/org/freedesktop/secrets/prompt";
 
 pub struct SecretService {
     storage: Arc<RwLock<Storage>>,
@@ -131,9 +139,20 @@ impl SecretService {
         &self,
         objects: Vec<OwnedObjectPath>,
     ) -> zbus::fdo::Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
-        // For now, everything is auto-unlocked
-        let prompt_path = OwnedObjectPath::try_from("/").unwrap();
-        Ok((objects, prompt_path))
+        let storage: RwLockReadGuard<'_, Storage> = self.storage.read().await;
+        if !storage.is_locked() {
+            return Ok((
+                objects,
+                OwnedObjectPath::try_from(ROOT_PROMPT_PATH).unwrap(),
+            ));
+        }
+        drop(storage);
+
+        let prompt_path =
+            register_unlock_prompt(&self.connection, self.storage.clone(), objects.clone())
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok((vec![], prompt_path))
     }
 
     /// Lock collections or items
@@ -144,7 +163,7 @@ impl SecretService {
         let mut storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
         storage.lock();
 
-        let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+        let prompt_path = OwnedObjectPath::try_from(ROOT_PROMPT_PATH).unwrap();
         Ok((objects, prompt_path))
     }
 
@@ -459,6 +478,105 @@ impl SecretItem {
     }
 }
 
+pub struct SecretPrompt {
+    storage: Arc<RwLock<Storage>>,
+    connection: Connection,
+    path: OwnedObjectPath,
+    objects: Vec<OwnedObjectPath>,
+    completed: AtomicBool,
+}
+
+impl SecretPrompt {
+    pub fn new(
+        storage: Arc<RwLock<Storage>>,
+        connection: Connection,
+        path: OwnedObjectPath,
+        objects: Vec<OwnedObjectPath>,
+    ) -> Self {
+        Self {
+            storage,
+            connection,
+            path,
+            objects,
+            completed: AtomicBool::new(false),
+        }
+    }
+
+    fn take_completion_slot(&self) -> bool {
+        self.completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    async fn finish_prompt(
+        &self,
+        ctxt: &SignalEmitter<'_>,
+        dismissed: bool,
+        objects: Vec<OwnedObjectPath>,
+    ) -> zbus::fdo::Result<()> {
+        let result: OwnedValue = OwnedValue::try_from(Value::new(objects))
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::completed(ctxt, dismissed, result)
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        let _ = self
+            .connection
+            .object_server()
+            .remove::<SecretPrompt, _>(self.path.as_str())
+            .await;
+        Ok(())
+    }
+
+    async fn completion_from_unlock(&self, window_id: &str) -> (bool, Vec<OwnedObjectPath>) {
+        let Some(password) = request_prompt_password(window_id) else {
+            return (true, vec![]);
+        };
+
+        let mut storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
+        match storage.unlock(&password) {
+            Ok(()) => (false, self.objects.clone()),
+            Err(error) => {
+                tracing::warn!("Prompt unlock failed: {}", error);
+                (false, vec![])
+            }
+        }
+    }
+}
+
+#[interface(name = "org.freedesktop.Secret.Prompt")]
+impl SecretPrompt {
+    async fn prompt(
+        &self,
+        window_id: &str,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        if !self.take_completion_slot() {
+            return Ok(());
+        }
+
+        let (dismissed, objects) = self.completion_from_unlock(window_id).await;
+        self.finish_prompt(&ctxt, dismissed, objects).await
+    }
+
+    async fn dismiss(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        if !self.take_completion_slot() {
+            return Ok(());
+        }
+        self.finish_prompt(&ctxt, true, vec![]).await
+    }
+
+    #[zbus(signal)]
+    async fn completed(
+        ctxt: &SignalEmitter<'_>,
+        dismissed: bool,
+        result: OwnedValue,
+    ) -> zbus::Result<()>;
+}
+
 pub async fn start_service(
     storage: Arc<RwLock<Storage>>,
     access: Arc<AccessControl>,
@@ -535,6 +653,103 @@ async fn register_existing_item_objects(
     Ok(())
 }
 
+async fn register_unlock_prompt(
+    connection: &Connection,
+    storage: Arc<RwLock<Storage>>,
+    objects: Vec<OwnedObjectPath>,
+) -> zbus::Result<OwnedObjectPath> {
+    for _ in 0..8 {
+        let path = prompt_object_path();
+        let prompt = SecretPrompt::new(
+            storage.clone(),
+            connection.clone(),
+            path.clone(),
+            objects.clone(),
+        );
+        match connection.object_server().at(path.as_str(), prompt).await {
+            Ok(_) => return Ok(path),
+            Err(zbus::Error::InterfaceExists(_, _)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(zbus::Error::Failure(
+        "Unable to allocate unique prompt path".to_string(),
+    ))
+}
+
+fn prompt_object_path() -> OwnedObjectPath {
+    OwnedObjectPath::try_from(format!(
+        "{}/prompt{}",
+        PROMPT_PATH_PREFIX,
+        rand::random::<u64>()
+    ))
+    .expect("prompt path format is valid")
+}
+
+fn request_prompt_password(window_id: &str) -> Option<String> {
+    if !confirm_prompt_via_authd(window_id) {
+        return None;
+    }
+
+    extract_prompt_password(window_id)
+}
+
+fn extract_prompt_password(window_id: &str) -> Option<String> {
+    // Temporary transport until authd can return entered passwords to callers.
+    if let Some(password) = window_id.strip_prefix("password:") {
+        if !password.is_empty() {
+            return Some(password.to_string());
+        }
+    }
+
+    std::env::var("KEYRING_PROMPT_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn confirm_prompt_via_authd(window_id: &str) -> bool {
+    confirm_prompt_via_authd_sync(window_id)
+}
+
+fn confirm_prompt_via_authd_sync(window_id: &str) -> bool {
+    let target =
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/keyring-daemon"));
+    let mut env = collect_wayland_env();
+    env.insert(
+        "KEYRING_PROMPT_WINDOW_ID".to_string(),
+        window_id.to_string(),
+    );
+
+    let request = AuthRequest {
+        target,
+        args: vec!["unlock keyring".to_string()],
+        env,
+        password: String::new(),
+        confirm_only: true,
+    };
+
+    match IpcClient::call(AUTHD_SOCKET_PATH, &request) {
+        Ok(AuthResponse::Success { .. } | AuthResponse::UnknownTarget) => true,
+        Ok(AuthResponse::Denied { reason }) => {
+            tracing::info!("authd denied keyring prompt: {}", reason);
+            false
+        }
+        Ok(AuthResponse::AuthFailed) => false,
+        Ok(AuthResponse::Error { message }) => {
+            tracing::warn!("authd prompt error: {}", message);
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                "authd socket unavailable, proceeding without prompt gate: {}",
+                error
+            );
+            true
+        }
+    }
+}
+
 async fn caller_pid(connection: &Connection, sender: &str) -> Option<u32> {
     let reply = connection
         .call_method(
@@ -596,6 +811,96 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tokio::time::sleep;
+
+    #[test]
+    fn extract_prompt_password_from_window_id_token() {
+        assert_eq!(
+            extract_prompt_password("password:test-password"),
+            Some("test-password".to_string())
+        );
+        assert_eq!(extract_prompt_password("0"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn unlock_returns_live_prompt_path_when_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage.lock();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service_connection = start_service(storage.clone(), access).await.unwrap();
+
+        let client = Connection::session().await.unwrap();
+        let objects =
+            vec![OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default").unwrap()];
+        let response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "Unlock",
+                &(objects,),
+            )
+            .await
+            .unwrap();
+        let (unlocked, prompt_path): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+            response.body().deserialize().unwrap();
+
+        assert!(unlocked.is_empty());
+        assert_ne!(prompt_path.as_str(), ROOT_PROMPT_PATH);
+        assert!(prompt_path.as_str().starts_with(PROMPT_PATH_PREFIX));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn prompt_unlocks_collection_with_password_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage.lock();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service_connection = start_service(storage.clone(), access).await.unwrap();
+
+        let client = Connection::session().await.unwrap();
+        let objects =
+            vec![OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default").unwrap()];
+        let unlock_response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "Unlock",
+                &(objects,),
+            )
+            .await
+            .unwrap();
+        let (_unlocked, prompt_path): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+            unlock_response.body().deserialize().unwrap();
+
+        client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                prompt_path.as_str(),
+                Some("org.freedesktop.Secret.Prompt"),
+                "Prompt",
+                &("password:test-password",),
+            )
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        let storage = storage.read().await;
+        assert!(!storage.is_locked());
+    }
 
     #[tokio::test]
     #[ignore = "requires secret-tool under isolated dbus-run-session"]
