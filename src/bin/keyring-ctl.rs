@@ -1,8 +1,20 @@
+#[path = "../crypto.rs"]
+mod crypto;
+#[path = "keyring_ctl/destination_import.rs"]
+mod destination_import;
+#[path = "../error.rs"]
+mod error;
 #[path = "keyring_ctl/source_reader.rs"]
 mod source_reader;
+#[path = "../storage.rs"]
+mod storage;
 
 use clap::{Args, Parser, Subcommand};
-use source_reader::{SourceReaderError, SourceSnapshot, read_secret_service_source};
+use destination_import::{
+    DestinationImportError, ImportSummary, import_snapshot_into_default_storage,
+};
+use source_reader::{SourceSnapshot, read_secret_service_source};
+use thiserror::Error;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -32,13 +44,33 @@ struct ImportGnomeArgs {
     collections: Vec<String>,
 }
 
-async fn run_import_gnome(args: &ImportGnomeArgs) -> Result<(), SourceReaderError> {
+async fn run_import_gnome(args: &ImportGnomeArgs) -> Result<(), ImportGnomeError> {
     let snapshot = read_secret_service_source(&args.collections).await?;
-    print_source_snapshot(&snapshot, args);
+    let import_summary = if args.dry_run {
+        None
+    } else {
+        Some(
+            import_snapshot_into_default_storage(&snapshot)
+                .map_err(ImportGnomeError::Destination)?,
+        )
+    };
+    print_source_snapshot(&snapshot, args, import_summary.as_ref());
     Ok(())
 }
 
-fn print_source_snapshot(snapshot: &SourceSnapshot, args: &ImportGnomeArgs) {
+#[derive(Debug, Error)]
+enum ImportGnomeError {
+    #[error("{0}")]
+    Source(#[from] source_reader::SourceReaderError),
+    #[error("{0}")]
+    Destination(#[from] DestinationImportError),
+}
+
+fn print_source_snapshot(
+    snapshot: &SourceSnapshot,
+    args: &ImportGnomeArgs,
+    import_summary: Option<&ImportSummary>,
+) {
     let total_items: usize = snapshot.collections.iter().map(|c| c.items.len()).sum();
     let mode = if args.dry_run { "dry-run" } else { "apply" };
     println!(
@@ -71,8 +103,13 @@ fn print_source_snapshot(snapshot: &SourceSnapshot, args: &ImportGnomeArgs) {
         );
     }
 
-    if !args.dry_run {
-        println!("Destination import not implemented yet; source reader is now active.");
+    if let Some(summary) = import_summary {
+        println!(
+            "Imported: {} new collection(s), {} existing collection(s), {} item(s)",
+            summary.collections_created, summary.collections_existing, summary.items_created
+        );
+    } else if !args.dry_run {
+        println!("No destination writes were performed.");
     }
 }
 
@@ -156,6 +193,6 @@ mod tests {
             collections: vec![],
         };
 
-        print_source_snapshot(&snapshot, &args);
+        print_source_snapshot(&snapshot, &args, None);
     }
 }
