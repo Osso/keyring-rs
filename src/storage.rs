@@ -1,6 +1,6 @@
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -385,6 +385,92 @@ impl Storage {
         Ok(removed)
     }
 
+    pub fn delete_collection(&self, name: &str) -> Result<Option<Vec<u64>>> {
+        let write_txn = self.db.begin_write()?;
+        if !Self::remove_collection_entry(&write_txn, name)? {
+            return Ok(None);
+        }
+
+        let deleted_item_ids = Self::remove_items_in_collection(&write_txn, name)?;
+        Self::remove_attributes_for_items(&write_txn, &deleted_item_ids)?;
+        Self::remove_aliases_for_collection(&write_txn, name)?;
+
+        write_txn.commit()?;
+        Ok(Some(deleted_item_ids))
+    }
+
+    fn remove_collection_entry(write_txn: &WriteTransaction, name: &str) -> Result<bool> {
+        let mut collections_table = write_txn.open_table(COLLECTIONS)?;
+        Ok(collections_table.remove(name)?.is_some())
+    }
+
+    fn remove_items_in_collection(write_txn: &WriteTransaction, name: &str) -> Result<Vec<u64>> {
+        let mut items_table = write_txn.open_table(ITEMS)?;
+        let mut deleted_item_ids = Vec::new();
+
+        for entry in items_table.iter()? {
+            let (id_guard, item_data) = entry?;
+            let item: Item = serde_json::from_slice(item_data.value())?;
+            if item.collection == name {
+                deleted_item_ids.push(id_guard.value());
+            }
+        }
+
+        for item_id in &deleted_item_ids {
+            items_table.remove(*item_id)?;
+        }
+
+        Ok(deleted_item_ids)
+    }
+
+    fn remove_attributes_for_items(write_txn: &WriteTransaction, item_ids: &[u64]) -> Result<()> {
+        if item_ids.is_empty() {
+            return Ok(());
+        }
+
+        let item_ids: HashSet<u64> = item_ids.iter().copied().collect();
+        let mut attrs_table = write_txn.open_table(ATTRIBUTES)?;
+        let mut keys_to_remove = Vec::new();
+
+        for entry in attrs_table.iter()? {
+            let (key_guard, _) = entry?;
+            let (item_id, key) = key_guard.value();
+            if item_ids.contains(&item_id) {
+                keys_to_remove.extend([(item_id, key.to_string())]);
+            }
+        }
+
+        for (item_id, key) in keys_to_remove {
+            attrs_table.remove((item_id, key.as_str()))?;
+        }
+
+        Ok(())
+    }
+
+    fn remove_aliases_for_collection(write_txn: &WriteTransaction, name: &str) -> Result<()> {
+        let mut metadata_table = write_txn.open_table(METADATA)?;
+        let mut alias_keys_to_remove = Vec::new();
+
+        for entry in metadata_table.iter()? {
+            let (key_guard, value_guard) = entry?;
+            let key = key_guard.value();
+            if !key.starts_with(ALIAS_METADATA_KEY_PREFIX) {
+                continue;
+            }
+
+            let aliased_collection: String = serde_json::from_slice(value_guard.value())?;
+            if aliased_collection == name {
+                alias_keys_to_remove.push(key.to_string());
+            }
+        }
+
+        for alias_key in alias_keys_to_remove {
+            metadata_table.remove(alias_key.as_str())?;
+        }
+
+        Ok(())
+    }
+
     fn load_password_sentinel(
         &self,
     ) -> Result<Option<(Vec<u8>, [u8; PASSWORD_SENTINEL_NONCE_SIZE])>> {
@@ -569,5 +655,44 @@ mod tests {
             reopened.get_alias("favorite").unwrap(),
             Some("default".to_string())
         );
+    }
+
+    #[test]
+    fn delete_collection_removes_items_attributes_and_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage.create_collection("work", "Work").unwrap();
+
+        storage.set_alias("favorite", Some("work")).unwrap();
+        storage.set_alias("primary", Some("default")).unwrap();
+
+        let mut work_attrs = HashMap::new();
+        work_attrs.insert("service".to_string(), "work.example".to_string());
+        let work_item_id = storage
+            .create_item("work", "Work Item", b"work-secret", work_attrs)
+            .unwrap();
+
+        let mut default_attrs = HashMap::new();
+        default_attrs.insert("service".to_string(), "default.example".to_string());
+        let default_item_id = storage
+            .create_item("default", "Default Item", b"default-secret", default_attrs)
+            .unwrap();
+
+        let deleted_item_ids = storage.delete_collection("work").unwrap().unwrap();
+        assert_eq!(deleted_item_ids, vec![work_item_id]);
+        assert!(storage.get_collection("work").unwrap().is_none());
+        assert!(storage.get_item(work_item_id).unwrap().is_none());
+        assert!(storage.get_item(default_item_id).unwrap().is_some());
+        assert_eq!(storage.get_alias("favorite").unwrap(), None);
+        assert_eq!(
+            storage.get_alias("primary").unwrap(),
+            Some("default".to_string())
+        );
+
+        let missing = storage.delete_collection("missing").unwrap();
+        assert_eq!(missing, None);
     }
 }

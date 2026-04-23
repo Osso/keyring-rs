@@ -178,7 +178,15 @@ impl SecretService {
         }
 
         if name == "default" {
-            collection_object_path("default")
+            if storage
+                .get_collection("default")
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .is_some()
+            {
+                collection_object_path("default")
+            } else {
+                Ok(OwnedObjectPath::try_from(ROOT_PROMPT_PATH).unwrap())
+            }
         } else {
             Ok(OwnedObjectPath::try_from(ROOT_PROMPT_PATH).unwrap())
         }
@@ -324,7 +332,36 @@ impl SecretCollection {
 
     /// Delete this collection
     async fn delete(&self) -> zbus::fdo::Result<OwnedObjectPath> {
-        // TODO: implement collection deletion
+        let deleted_item_ids = {
+            let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
+            storage
+                .delete_collection(&self.name)
+                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed(format!("Collection not found: {}", self.name))
+                })?
+        };
+
+        for item_id in deleted_item_ids {
+            if let Err(error) = unregister_item_object(&self.connection, &self.name, item_id).await
+            {
+                tracing::warn!(
+                    "Failed to unregister deleted item object {} in {}: {}",
+                    item_id,
+                    self.name,
+                    error
+                );
+            }
+        }
+
+        if let Err(error) = unregister_collection_object(&self.connection, &self.name).await {
+            tracing::warn!(
+                "Failed to unregister deleted collection object {}: {}",
+                self.name,
+                error
+            );
+        }
+
         Ok(OwnedObjectPath::try_from("/").unwrap())
     }
 
@@ -683,6 +720,39 @@ async fn register_item_object(
     Ok(path)
 }
 
+async fn unregister_item_object(
+    connection: &Connection,
+    collection: &str,
+    id: u64,
+) -> zbus::Result<()> {
+    let path = item_object_path(collection, id)?;
+    match connection
+        .object_server()
+        .remove::<SecretItem, _>(path.as_str())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(zbus::Error::InterfaceNotFound) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn unregister_collection_object(
+    connection: &Connection,
+    collection: &str,
+) -> zbus::Result<()> {
+    let path = collection_object_path(collection).map_err(zbus::Error::from)?;
+    match connection
+        .object_server()
+        .remove::<SecretCollection, _>(path.as_str())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(zbus::Error::InterfaceNotFound) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 async fn register_existing_item_objects(
     connection: &Connection,
     storage: Arc<RwLock<Storage>>,
@@ -1008,6 +1078,71 @@ mod tests {
 
         let storage = storage.read().await;
         assert_eq!(storage.get_alias("test").unwrap(), Some("work".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn delete_collection_removes_items_and_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        let item_id = storage
+            .create_item(
+                "default",
+                "Default Item",
+                b"default-secret",
+                HashMap::from([("service".to_string(), "default.example".to_string())]),
+            )
+            .unwrap();
+        storage.set_alias("test", Some("default")).unwrap();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service_connection = start_service(storage.clone(), access).await.unwrap();
+
+        let client = Connection::session().await.unwrap();
+        let delete_response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets/collection/default",
+                Some("org.freedesktop.Secret.Collection"),
+                "Delete",
+                &(),
+            )
+            .await
+            .unwrap();
+        let prompt_path: OwnedObjectPath = delete_response.body().deserialize().unwrap();
+        assert_eq!(prompt_path.as_str(), ROOT_PROMPT_PATH);
+
+        let alias_response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "ReadAlias",
+                &("test",),
+            )
+            .await
+            .unwrap();
+        let alias_path: OwnedObjectPath = alias_response.body().deserialize().unwrap();
+        assert_eq!(alias_path.as_str(), ROOT_PROMPT_PATH);
+
+        let storage = storage.read().await;
+        assert!(storage.get_collection("default").unwrap().is_none());
+        assert!(storage.get_item(item_id).unwrap().is_none());
+        assert_eq!(storage.get_alias("test").unwrap(), None);
+
+        let second_delete = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets/collection/default",
+                Some("org.freedesktop.Secret.Collection"),
+                "Delete",
+                &(),
+            )
+            .await;
+        assert!(second_delete.is_err());
     }
 
     #[tokio::test]
