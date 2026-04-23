@@ -52,3 +52,32 @@ jobs:
 
       - name: Run ignored D-Bus integration tests
         run: ./scripts/run_dbus_integration_tests.sh
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install dbus-run-session and secret-tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus dbus-x11 libsecret-tools
+
+      - name: Run coverage and enforce module thresholds
+        run: ./scripts/run_coverage_ci.sh
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: target/llvm-cov
