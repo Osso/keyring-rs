@@ -1,11 +1,18 @@
 // D-Bus Secret Service implementation
 // https://specifications.freedesktop.org/secret-service/latest/
 
+use aes::Aes128;
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use authd_protocol::{
     AuthRequest, AuthResponse, SOCKET_PATH as AUTHD_SOCKET_PATH, collect_wayland_env,
 };
+use cbc::{Decryptor as Aes128CbcDec, Encryptor as Aes128CbcEnc};
+use hkdf::Hkdf;
+use num_bigint::BigUint;
 use peercred_ipc::Client as IpcClient;
-use std::collections::{HashMap, HashSet};
+use rand::{RngCore, rngs::OsRng};
+use sha2::Sha256;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,25 +26,55 @@ use crate::storage::Storage;
 
 // Secret struct as per D-Bus spec: (session, parameters, value, content_type)
 type Secret = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
+type SessionMap = HashMap<String, SessionState>;
 const ROOT_PROMPT_PATH: &str = "/";
 const PROMPT_PATH_PREFIX: &str = "/org/freedesktop/secrets/prompt";
+const SESSION_PATH_PREFIX: &str = "/org/freedesktop/secrets/session";
+const ALGORITHM_PLAIN: &str = "plain";
+const ALGORITHM_DH: &str = "dh-ietf1024-sha256-aes128-cbc-pkcs7";
+const DH_AES_KEY_SIZE: usize = 16;
+const DH_IV_SIZE: usize = 16;
+const DH_SHARED_SECRET_SIZE: usize = 128;
+const DH_GENERATOR: u8 = 2;
+const DH_GROUP_PRIME_BYTES: [u8; DH_SHARED_SECRET_SIZE] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0x0F, 0xDA, 0xA2, 0x21, 0x68, 0xC2, 0x34,
+    0xC4, 0xC6, 0x62, 0x8B, 0x80, 0xDC, 0x1C, 0xD1, 0x29, 0x02, 0x4E, 0x08, 0x8A, 0x67, 0xCC, 0x74,
+    0x02, 0x0B, 0xBE, 0xA6, 0x3B, 0x13, 0x9B, 0x22, 0x51, 0x4A, 0x08, 0x79, 0x8E, 0x34, 0x04, 0xDD,
+    0xEF, 0x95, 0x19, 0xB3, 0xCD, 0x3A, 0x43, 0x1B, 0x30, 0x2B, 0x0A, 0x6D, 0xF2, 0x5F, 0x14, 0x37,
+    0x4F, 0xE1, 0x35, 0x6D, 0x6D, 0x51, 0xC2, 0x45, 0xE4, 0x85, 0xB5, 0x76, 0x62, 0x5E, 0x7E, 0xC6,
+    0xF4, 0x4C, 0x42, 0xE9, 0xA6, 0x37, 0xED, 0x6B, 0x0B, 0xFF, 0x5C, 0xB6, 0xF4, 0x06, 0xB7, 0xED,
+    0xEE, 0x38, 0x6B, 0xFB, 0x5A, 0x89, 0x9F, 0xA5, 0xAE, 0x9F, 0x24, 0x11, 0x7C, 0x4B, 0x1F, 0xE6,
+    0x49, 0x28, 0x66, 0x51, 0xEC, 0xE6, 0x53, 0x81, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+];
+
+#[derive(Clone)]
+enum SessionEncryption {
+    Plain,
+    Dh { key: [u8; DH_AES_KEY_SIZE] },
+}
+
+#[derive(Clone)]
+struct SessionState {
+    encryption: SessionEncryption,
+}
 
 pub struct SecretService {
     storage: Arc<RwLock<Storage>>,
-    sessions: Arc<RwLock<HashSet<String>>>,
+    sessions: Arc<RwLock<SessionMap>>,
     access: Arc<AccessControl>,
     connection: Connection,
 }
 
 impl SecretService {
-    pub fn new(
+    fn new(
         storage: Arc<RwLock<Storage>>,
+        sessions: Arc<RwLock<SessionMap>>,
         access: Arc<AccessControl>,
         connection: Connection,
     ) -> Self {
         Self {
             storage,
-            sessions: Arc::new(RwLock::new(HashSet::new())),
+            sessions,
             access,
             connection,
         }
@@ -50,24 +87,32 @@ impl SecretService {
     async fn open_session(
         &self,
         algorithm: &str,
-        _input: Value<'_>,
+        input: Value<'_>,
     ) -> zbus::fdo::Result<(OwnedValue, OwnedObjectPath)> {
-        if algorithm != "plain" {
-            return Err(zbus::fdo::Error::NotSupported(
-                "Only 'plain' algorithm supported".into(),
-            ));
-        }
+        let (encryption, output) = match algorithm {
+            ALGORITHM_PLAIN => {
+                validate_plain_session_input(&input)?;
+                (
+                    SessionEncryption::Plain,
+                    OwnedValue::try_from(Value::new(String::new())).unwrap(),
+                )
+            }
+            ALGORITHM_DH => {
+                let (session_encryption, service_public_key) =
+                    negotiate_dh_session_encryption(input)?;
+                let output = OwnedValue::try_from(Value::new(service_public_key))
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                (session_encryption, output)
+            }
+            _ => {
+                return Err(zbus::fdo::Error::NotSupported(format!(
+                    "Unsupported algorithm: {}",
+                    algorithm
+                )));
+            }
+        };
 
-        let session_id = format!("session{}", rand::random::<u32>());
-        let session_path = format!("/org/freedesktop/secrets/session/{}", session_id);
-
-        let mut sessions: RwLockWriteGuard<'_, HashSet<String>> = self.sessions.write().await;
-        sessions.insert(session_id.clone());
-
-        Ok((
-            OwnedValue::try_from(Value::new("")).unwrap(),
-            OwnedObjectPath::try_from(session_path).unwrap(),
-        ))
+        register_session_object(&self.connection, self.sessions.clone(), encryption, output).await
     }
 
     /// Search for items matching attributes
@@ -110,6 +155,8 @@ impl SecretService {
             check_sender_access(&self.connection, &self.access, sender.as_str()).await?;
         }
 
+        let session_encryption =
+            resolve_session_encryption(&self.sessions, session.as_str()).await?;
         let storage: RwLockReadGuard<'_, Storage> = self.storage.read().await;
         let mut result: HashMap<OwnedObjectPath, Secret> = HashMap::new();
 
@@ -119,12 +166,12 @@ impl SecretService {
             if let Some(id_str) = path_str.rsplit('/').next() {
                 if let Ok(id) = id_str.parse::<u64>() {
                     if let Ok(Some(item)) = storage.get_item(id) {
-                        let secret: Secret = (
+                        let secret = encode_secret_for_transport(
                             session.clone(),
-                            vec![],                   // parameters (empty for plain)
-                            item.secret,              // the actual secret
-                            "text/plain".to_string(), // content type
-                        );
+                            &session_encryption,
+                            &item.secret,
+                            "text/plain",
+                        )?;
                         result.insert(item_path, secret);
                     }
                 }
@@ -238,14 +285,21 @@ impl SecretService {
 // Collection interface
 pub struct SecretCollection {
     storage: Arc<RwLock<Storage>>,
+    sessions: Arc<RwLock<SessionMap>>,
     name: String,
     connection: Connection,
 }
 
 impl SecretCollection {
-    pub fn new(storage: Arc<RwLock<Storage>>, name: String, connection: Connection) -> Self {
+    fn new(
+        storage: Arc<RwLock<Storage>>,
+        sessions: Arc<RwLock<SessionMap>>,
+        name: String,
+        connection: Connection,
+    ) -> Self {
         Self {
             storage,
+            sessions,
             name,
             connection,
         }
@@ -284,20 +338,11 @@ impl SecretCollection {
         replace: bool,
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<(OwnedObjectPath, OwnedObjectPath)> {
+        let decoded_secret = decode_secret_for_storage(&self.sessions, &secret).await?;
+
         let id = {
             let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
-
-            // Extract label from properties
-            let label: String = properties
-                .get("org.freedesktop.Secret.Item.Label")
-                .and_then(|v| TryInto::<String>::try_into(v.clone()).ok())
-                .unwrap_or_else(|| "Unnamed".to_string());
-
-            // Extract attributes from properties
-            let attributes: HashMap<String, String> = properties
-                .get("org.freedesktop.Secret.Item.Attributes")
-                .and_then(|v| TryInto::<HashMap<String, String>>::try_into(v.clone()).ok())
-                .unwrap_or_default();
+            let (label, attributes) = extract_item_properties(&properties);
 
             // If replace is true, search for existing item with same attributes
             if replace && !attributes.is_empty() {
@@ -310,16 +355,21 @@ impl SecretCollection {
                 }
             }
 
-            // Create the item - secret.2 is the actual secret bytes
+            // Create the item with decoded secret bytes
             storage
-                .create_item(&self.name, &label, &secret.2, attributes)
+                .create_item(&self.name, &label, &decoded_secret, attributes)
                 .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
         };
 
-        let item_path =
-            register_item_object(&self.connection, self.storage.clone(), &self.name, id)
-                .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        let item_path = register_item_object(
+            &self.connection,
+            self.storage.clone(),
+            self.sessions.clone(),
+            &self.name,
+            id,
+        )
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         // No prompt needed
         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
@@ -439,14 +489,21 @@ impl SecretCollection {
 // Item interface
 pub struct SecretItem {
     storage: Arc<RwLock<Storage>>,
+    sessions: Arc<RwLock<SessionMap>>,
     collection: String,
     id: u64,
 }
 
 impl SecretItem {
-    pub fn new(storage: Arc<RwLock<Storage>>, collection: String, id: u64) -> Self {
+    fn new(
+        storage: Arc<RwLock<Storage>>,
+        sessions: Arc<RwLock<SessionMap>>,
+        collection: String,
+        id: u64,
+    ) -> Self {
         Self {
             storage,
+            sessions,
             collection,
             id,
         }
@@ -457,6 +514,8 @@ impl SecretItem {
 impl SecretItem {
     /// Get the secret
     async fn get_secret(&self, session: OwnedObjectPath) -> zbus::fdo::Result<Secret> {
+        let session_encryption =
+            resolve_session_encryption(&self.sessions, session.as_str()).await?;
         let storage: RwLockReadGuard<'_, Storage> = self.storage.read().await;
 
         let item = storage
@@ -464,11 +523,12 @@ impl SecretItem {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
             .ok_or_else(|| zbus::fdo::Error::Failed("Item not found".into()))?;
 
-        Ok((session, vec![], item.secret, "text/plain".to_string()))
+        encode_secret_for_transport(session, &session_encryption, &item.secret, "text/plain")
     }
 
     /// Set the secret
     async fn set_secret(&self, secret: Secret) -> zbus::fdo::Result<()> {
+        let decoded_secret = decode_secret_for_storage(&self.sessions, &secret).await?;
         let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
 
         // Get existing item to preserve attributes
@@ -486,7 +546,7 @@ impl SecretItem {
             .create_item(
                 &self.collection,
                 &existing.label,
-                &secret.2,
+                &decoded_secret,
                 existing.attributes,
             )
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
@@ -551,7 +611,7 @@ pub struct SecretPrompt {
 }
 
 impl SecretPrompt {
-    pub fn new(
+    fn new(
         storage: Arc<RwLock<Storage>>,
         connection: Connection,
         path: OwnedObjectPath,
@@ -641,36 +701,65 @@ impl SecretPrompt {
     ) -> zbus::Result<()>;
 }
 
+pub struct SecretSession {
+    sessions: Arc<RwLock<SessionMap>>,
+    connection: Connection,
+    path: OwnedObjectPath,
+}
+
+impl SecretSession {
+    fn new(
+        sessions: Arc<RwLock<SessionMap>>,
+        connection: Connection,
+        path: OwnedObjectPath,
+    ) -> Self {
+        Self {
+            sessions,
+            connection,
+            path,
+        }
+    }
+}
+
+#[interface(name = "org.freedesktop.Secret.Session")]
+impl SecretSession {
+    async fn close(&self) -> zbus::fdo::Result<()> {
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(self.path.as_str());
+        }
+
+        let _ = self
+            .connection
+            .object_server()
+            .remove::<SecretSession, _>(self.path.as_str())
+            .await;
+        Ok(())
+    }
+}
+
 pub async fn start_service(
     storage: Arc<RwLock<Storage>>,
     access: Arc<AccessControl>,
 ) -> zbus::Result<Connection> {
     let connection = Connection::session().await?;
+    let sessions = Arc::new(RwLock::new(HashMap::new()));
 
     // Register main service
-    let service = SecretService::new(storage.clone(), access.clone(), connection.clone());
+    let service = SecretService::new(
+        storage.clone(),
+        sessions.clone(),
+        access.clone(),
+        connection.clone(),
+    );
     connection
         .object_server()
         .at("/org/freedesktop/secrets", service)
         .await?;
 
-    // Register default collection
-    let collection =
-        SecretCollection::new(storage.clone(), "default".to_string(), connection.clone());
-    connection
-        .object_server()
-        .at("/org/freedesktop/secrets/collection/default", collection)
-        .await?;
+    register_default_collection_objects(&connection, storage.clone(), sessions.clone()).await?;
 
-    // Register alias for default collection
-    let alias_collection =
-        SecretCollection::new(storage.clone(), "default".to_string(), connection.clone());
-    connection
-        .object_server()
-        .at("/org/freedesktop/secrets/aliases/default", alias_collection)
-        .await?;
-
-    register_existing_item_objects(&connection, storage).await?;
+    register_existing_item_objects(&connection, storage, sessions).await?;
 
     connection.request_name("org.freedesktop.secrets").await?;
 
@@ -708,14 +797,54 @@ fn collection_name_from_path(path: &str) -> Option<Option<String>> {
     Some(Some(collection_name.to_string()))
 }
 
+async fn register_default_collection_objects(
+    connection: &Connection,
+    storage: Arc<RwLock<Storage>>,
+    sessions: Arc<RwLock<SessionMap>>,
+) -> zbus::Result<()> {
+    let collection = SecretCollection::new(
+        storage.clone(),
+        sessions.clone(),
+        "default".to_string(),
+        connection.clone(),
+    );
+    connection
+        .object_server()
+        .at("/org/freedesktop/secrets/collection/default", collection)
+        .await?;
+
+    let alias_collection =
+        SecretCollection::new(storage, sessions, "default".to_string(), connection.clone());
+    connection
+        .object_server()
+        .at("/org/freedesktop/secrets/aliases/default", alias_collection)
+        .await?;
+    Ok(())
+}
+
+fn extract_item_properties(
+    properties: &HashMap<String, OwnedValue>,
+) -> (String, HashMap<String, String>) {
+    let label = properties
+        .get("org.freedesktop.Secret.Item.Label")
+        .and_then(|v| TryInto::<String>::try_into(v.clone()).ok())
+        .unwrap_or_else(|| "Unnamed".to_string());
+    let attributes = properties
+        .get("org.freedesktop.Secret.Item.Attributes")
+        .and_then(|v| TryInto::<HashMap<String, String>>::try_into(v.clone()).ok())
+        .unwrap_or_default();
+    (label, attributes)
+}
+
 async fn register_item_object(
     connection: &Connection,
     storage: Arc<RwLock<Storage>>,
+    sessions: Arc<RwLock<SessionMap>>,
     collection: &str,
     id: u64,
 ) -> zbus::Result<OwnedObjectPath> {
     let path = item_object_path(collection, id)?;
-    let item = SecretItem::new(storage, collection.to_string(), id);
+    let item = SecretItem::new(storage, sessions, collection.to_string(), id);
     connection.object_server().at(path.as_str(), item).await?;
     Ok(path)
 }
@@ -756,6 +885,7 @@ async fn unregister_collection_object(
 async fn register_existing_item_objects(
     connection: &Connection,
     storage: Arc<RwLock<Storage>>,
+    sessions: Arc<RwLock<SessionMap>>,
 ) -> zbus::Result<()> {
     let item_locations = {
         let storage_guard: RwLockReadGuard<'_, Storage> = storage.read().await;
@@ -765,7 +895,14 @@ async fn register_existing_item_objects(
     };
 
     for (collection, id) in item_locations {
-        register_item_object(connection, storage.clone(), &collection, id).await?;
+        register_item_object(
+            connection,
+            storage.clone(),
+            sessions.clone(),
+            &collection,
+            id,
+        )
+        .await?;
     }
 
     Ok(())
@@ -803,6 +940,214 @@ fn prompt_object_path() -> OwnedObjectPath {
         rand::random::<u64>()
     ))
     .expect("prompt path format is valid")
+}
+
+fn session_object_path() -> OwnedObjectPath {
+    OwnedObjectPath::try_from(format!("{}/{}", SESSION_PATH_PREFIX, rand::random::<u64>()))
+        .expect("session path format is valid")
+}
+
+async fn register_session_object(
+    connection: &Connection,
+    sessions: Arc<RwLock<SessionMap>>,
+    encryption: SessionEncryption,
+    output: OwnedValue,
+) -> zbus::fdo::Result<(OwnedValue, OwnedObjectPath)> {
+    for _ in 0..8 {
+        let session_path = session_object_path();
+        let session =
+            SecretSession::new(sessions.clone(), connection.clone(), session_path.clone());
+
+        match connection
+            .object_server()
+            .at(session_path.as_str(), session)
+            .await
+        {
+            Ok(_) => {
+                let mut sessions = sessions.write().await;
+                sessions.insert(
+                    session_path.as_str().to_string(),
+                    SessionState {
+                        encryption: encryption.clone(),
+                    },
+                );
+                return Ok((output, session_path));
+            }
+            Err(zbus::Error::InterfaceExists(_, _)) => continue,
+            Err(e) => return Err(zbus::fdo::Error::Failed(e.to_string())),
+        }
+    }
+
+    Err(zbus::fdo::Error::Failed(
+        "Unable to allocate unique session path".to_string(),
+    ))
+}
+
+fn validate_plain_session_input(input: &Value<'_>) -> zbus::fdo::Result<()> {
+    if let Ok(value) = String::try_from(input.clone()) {
+        if value.is_empty() {
+            return Ok(());
+        }
+    }
+
+    if let Ok(value) = Vec::<u8>::try_from(input.clone()) {
+        if value.is_empty() {
+            return Ok(());
+        }
+    }
+
+    Err(zbus::fdo::Error::InvalidArgs(
+        "plain algorithm expects an empty string or empty byte array input".to_string(),
+    ))
+}
+
+fn negotiate_dh_session_encryption(
+    input: Value<'_>,
+) -> zbus::fdo::Result<(SessionEncryption, Vec<u8>)> {
+    let client_public_key = parse_dh_public_key(input)?;
+    let (private_key, service_public_key) = generate_dh_keypair();
+    let key = derive_dh_aes_key(&client_public_key, &private_key)?;
+    Ok((SessionEncryption::Dh { key }, service_public_key))
+}
+
+fn parse_dh_public_key(input: Value<'_>) -> zbus::fdo::Result<BigUint> {
+    let public_key_bytes: Vec<u8> = Vec::<u8>::try_from(input).map_err(|_| {
+        zbus::fdo::Error::InvalidArgs(
+            "DH algorithm expects input variant with byte array".to_string(),
+        )
+    })?;
+    if public_key_bytes.is_empty() {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "DH public key cannot be empty".to_string(),
+        ));
+    }
+
+    Ok(BigUint::from_bytes_be(&public_key_bytes))
+}
+
+fn generate_dh_keypair() -> (BigUint, Vec<u8>) {
+    let prime = BigUint::from_bytes_be(&DH_GROUP_PRIME_BYTES);
+    let generator = BigUint::from(DH_GENERATOR);
+
+    let mut private_key_bytes = [0u8; DH_SHARED_SECRET_SIZE];
+    OsRng.fill_bytes(&mut private_key_bytes);
+    let private_key = BigUint::from_bytes_be(&private_key_bytes);
+    let public_key = generator.modpow(&private_key, &prime).to_bytes_be();
+
+    (private_key, public_key)
+}
+
+fn derive_dh_aes_key(
+    client_public: &BigUint,
+    private_key: &BigUint,
+) -> zbus::fdo::Result<[u8; 16]> {
+    let prime = BigUint::from_bytes_be(&DH_GROUP_PRIME_BYTES);
+    let one = BigUint::from(1u8);
+    let p_minus_one = &prime - &one;
+    if client_public <= &one || client_public >= &p_minus_one {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "DH public key out of range".to_string(),
+        ));
+    }
+
+    let shared_secret = client_public.modpow(private_key, &prime);
+    let shared_secret_bytes = shared_secret.to_bytes_be();
+    if shared_secret_bytes.len() > DH_SHARED_SECRET_SIZE {
+        return Err(zbus::fdo::Error::Failed(
+            "DH shared secret exceeded expected size".to_string(),
+        ));
+    }
+
+    let mut ikm = vec![0u8; DH_SHARED_SECRET_SIZE - shared_secret_bytes.len()];
+    ikm.extend(shared_secret_bytes);
+
+    let hkdf = Hkdf::<Sha256>::new(None, &ikm);
+    let mut key = [0u8; DH_AES_KEY_SIZE];
+    hkdf.expand(&[], &mut key)
+        .map_err(|_| zbus::fdo::Error::Failed("Failed to derive DH session key".to_string()))?;
+    Ok(key)
+}
+
+async fn resolve_session_encryption(
+    sessions: &Arc<RwLock<SessionMap>>,
+    session_path: &str,
+) -> zbus::fdo::Result<SessionEncryption> {
+    if session_path == ROOT_PROMPT_PATH {
+        return Ok(SessionEncryption::Plain);
+    }
+
+    let sessions = sessions.read().await;
+    sessions
+        .get(session_path)
+        .map(|state| state.encryption.clone())
+        .ok_or_else(|| zbus::fdo::Error::Failed(format!("Session not found: {}", session_path)))
+}
+
+async fn decode_secret_for_storage(
+    sessions: &Arc<RwLock<SessionMap>>,
+    secret: &Secret,
+) -> zbus::fdo::Result<Vec<u8>> {
+    let session = resolve_session_encryption(sessions, secret.0.as_str()).await?;
+    decode_secret_bytes(&session, &secret.1, &secret.2)
+}
+
+fn decode_secret_bytes(
+    session: &SessionEncryption,
+    parameters: &[u8],
+    value: &[u8],
+) -> zbus::fdo::Result<Vec<u8>> {
+    match session {
+        SessionEncryption::Plain => {
+            if !parameters.is_empty() {
+                return Err(zbus::fdo::Error::InvalidArgs(
+                    "plain session expects empty secret parameters".to_string(),
+                ));
+            }
+            Ok(value.to_vec())
+        }
+        SessionEncryption::Dh { key } => decrypt_dh_secret(value, parameters, key),
+    }
+}
+
+fn encode_secret_for_transport(
+    session_path: OwnedObjectPath,
+    session: &SessionEncryption,
+    secret: &[u8],
+    content_type: &str,
+) -> zbus::fdo::Result<Secret> {
+    let (parameters, value) = match session {
+        SessionEncryption::Plain => (vec![], secret.to_vec()),
+        SessionEncryption::Dh { key } => encrypt_dh_secret(secret, key)?,
+    };
+
+    Ok((session_path, parameters, value, content_type.to_string()))
+}
+
+fn encrypt_dh_secret(
+    secret: &[u8],
+    key: &[u8; DH_AES_KEY_SIZE],
+) -> zbus::fdo::Result<(Vec<u8>, Vec<u8>)> {
+    let mut iv = [0u8; DH_IV_SIZE];
+    OsRng.fill_bytes(&mut iv);
+
+    let ciphertext = Aes128CbcEnc::<Aes128>::new(key.into(), (&iv).into())
+        .encrypt_padded_vec_mut::<Pkcs7>(secret);
+    Ok((iv.to_vec(), ciphertext))
+}
+
+fn decrypt_dh_secret(
+    ciphertext: &[u8],
+    parameters: &[u8],
+    key: &[u8; DH_AES_KEY_SIZE],
+) -> zbus::fdo::Result<Vec<u8>> {
+    let iv: [u8; DH_IV_SIZE] = parameters.try_into().map_err(|_| {
+        zbus::fdo::Error::InvalidArgs(format!("DH secret parameter must be {} bytes", DH_IV_SIZE))
+    })?;
+
+    let plaintext = Aes128CbcDec::<Aes128>::new(key.into(), (&iv).into())
+        .decrypt_padded_vec_mut::<Pkcs7>(ciphertext)
+        .map_err(|_| zbus::fdo::Error::Failed("Failed to decrypt secret payload".to_string()))?;
+    Ok(plaintext)
 }
 
 fn request_prompt_password(window_id: &str) -> Option<String> {
@@ -956,6 +1301,96 @@ mod tests {
             collection_name_from_path("/org/freedesktop/secrets/collection/a/b"),
             None
         );
+    }
+
+    #[test]
+    fn dh_key_derivation_is_symmetric() {
+        let (private_a, public_a) = generate_dh_keypair();
+        let (private_b, public_b) = generate_dh_keypair();
+
+        let key_ab = derive_dh_aes_key(&BigUint::from_bytes_be(&public_b), &private_a).unwrap();
+        let key_ba = derive_dh_aes_key(&BigUint::from_bytes_be(&public_a), &private_b).unwrap();
+
+        assert_eq!(key_ab, key_ba);
+    }
+
+    #[test]
+    fn dh_encrypt_decrypt_roundtrip() {
+        let key = [7u8; DH_AES_KEY_SIZE];
+        let secret = b"transport-secret";
+        let (iv, ciphertext) = encrypt_dh_secret(secret, &key).unwrap();
+        assert_eq!(iv.len(), DH_IV_SIZE);
+        assert_ne!(ciphertext, secret);
+
+        let decrypted = decrypt_dh_secret(&ciphertext, &iv, &key).unwrap();
+        assert_eq!(decrypted, secret);
+    }
+
+    #[test]
+    fn plain_secret_rejects_non_empty_parameters() {
+        let error = decode_secret_bytes(&SessionEncryption::Plain, &[1, 2, 3], b"secret")
+            .expect_err("plain secret with parameters should fail");
+        assert!(matches!(error, zbus::fdo::Error::InvalidArgs(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn open_session_dh_get_secret_returns_encrypted_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        let item_id = storage
+            .create_item("default", "Default Item", b"dh-secret", HashMap::new())
+            .unwrap();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service_connection = start_service(storage, access).await.unwrap();
+
+        let (client_private, client_public) = generate_dh_keypair();
+        let client = Connection::session().await.unwrap();
+
+        let open_response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "OpenSession",
+                &(ALGORITHM_DH, Value::new(client_public)),
+            )
+            .await
+            .unwrap();
+        let (service_public, session_path): (OwnedValue, OwnedObjectPath) =
+            open_response.body().deserialize().unwrap();
+        let service_public_bytes: Vec<u8> = service_public.try_into().unwrap();
+        let client_key = derive_dh_aes_key(
+            &BigUint::from_bytes_be(&service_public_bytes),
+            &client_private,
+        )
+        .unwrap();
+
+        let item_path = item_object_path("default", item_id).unwrap();
+        let secret_response = client
+            .call_method(
+                Some("org.freedesktop.secrets"),
+                item_path.as_str(),
+                Some("org.freedesktop.Secret.Item"),
+                "GetSecret",
+                &(session_path.clone(),),
+            )
+            .await
+            .unwrap();
+
+        let (returned_session, parameters, value, content_type): Secret =
+            secret_response.body().deserialize().unwrap();
+        assert_eq!(returned_session.as_str(), session_path.as_str());
+        assert_eq!(content_type, "text/plain");
+        assert_eq!(parameters.len(), DH_IV_SIZE);
+        assert_ne!(value, b"dh-secret");
+
+        let decrypted = decrypt_dh_secret(&value, &parameters, &client_key).unwrap();
+        assert_eq!(decrypted, b"dh-secret");
     }
 
     #[tokio::test]
