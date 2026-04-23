@@ -469,28 +469,12 @@ impl SecretItem {
     async fn set_secret(&self, secret: Secret) -> zbus::fdo::Result<()> {
         let decoded_secret = decode_secret_for_storage(&self.sessions, &secret).await?;
         let storage: RwLockWriteGuard<'_, Storage> = self.storage.write().await;
-
-        // Get existing item to preserve attributes
-        let existing = storage
-            .get_item(self.id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
-            .ok_or_else(|| zbus::fdo::Error::Failed("Item not found".into()))?;
-
-        // Delete and recreate with new secret
-        storage
-            .delete_item(self.id)
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        storage
-            .create_item(
-                &self.collection,
-                &existing.label,
-                &decoded_secret,
-                existing.attributes,
-            )
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        Ok(())
+        replace_item_secret(
+            &storage,
+            self.id,
+            &self.collection,
+            decoded_secret.as_slice(),
+        )
     }
 
     /// Delete this item
@@ -773,6 +757,49 @@ fn extract_item_properties(
         .and_then(|v| TryInto::<HashMap<String, String>>::try_into(v.clone()).ok())
         .unwrap_or_default();
     (label, attributes)
+}
+
+fn replace_item_secret(
+    storage: &Storage,
+    item_id: u64,
+    collection_name: &str,
+    decoded_secret: &[u8],
+) -> zbus::fdo::Result<()> {
+    let existing = load_item_for_secret_update(storage, item_id)?;
+    recreate_item_with_secret(storage, item_id, collection_name, existing, decoded_secret)
+}
+
+fn load_item_for_secret_update(
+    storage: &Storage,
+    item_id: u64,
+) -> zbus::fdo::Result<crate::storage::DecryptedItem> {
+    storage
+        .get_item(item_id)
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
+        .ok_or_else(|| zbus::fdo::Error::Failed("Item not found".into()))
+}
+
+fn recreate_item_with_secret(
+    storage: &Storage,
+    item_id: u64,
+    collection_name: &str,
+    existing: crate::storage::DecryptedItem,
+    decoded_secret: &[u8],
+) -> zbus::fdo::Result<()> {
+    storage
+        .delete_item(item_id)
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+    storage
+        .create_item(
+            collection_name,
+            &existing.label,
+            decoded_secret,
+            existing.attributes,
+        )
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+    Ok(())
 }
 
 async fn create_or_replace_collection_item(
