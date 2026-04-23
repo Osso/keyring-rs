@@ -1,5 +1,11 @@
+#[cfg(test)]
+#[path = "../access.rs"]
+mod access;
 #[path = "../crypto.rs"]
 mod crypto;
+#[cfg(test)]
+#[path = "../dbus.rs"]
+mod dbus;
 #[path = "keyring_ctl/destination_import.rs"]
 mod destination_import;
 #[path = "../error.rs"]
@@ -157,6 +163,11 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+    use tokio::time::sleep;
 
     fn parse_import(args: &[&str]) -> ImportGnomeArgs {
         let cli = Cli::try_parse_from(args).expect("import-gnome args should parse");
@@ -231,5 +242,69 @@ mod tests {
 
         let summary = ImportSummary::for_dry_run(&snapshot);
         print_source_snapshot(&snapshot, &args, &summary);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn import_round_trip_lookup_from_seeded_source_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_db_path = dir.path().join("source.db");
+        let destination_db_path = dir.path().join("destination.db");
+
+        let attrs = HashMap::from([
+            ("service".to_string(), "import-smoke".to_string()),
+            ("user".to_string(), "alice".to_string()),
+        ]);
+
+        let mut source_storage = storage::Storage::open(&source_db_path).unwrap();
+        source_storage.unlock("source-password").unwrap();
+        source_storage
+            .create_collection("default", "Source Default")
+            .unwrap();
+        source_storage
+            .create_item(
+                "default",
+                "Imported Item",
+                b"imported-secret",
+                attrs.clone(),
+            )
+            .unwrap();
+
+        let source_storage = Arc::new(RwLock::new(source_storage));
+        let source_access = Arc::new(access::AccessControl::new(false));
+        let source_connection = dbus::start_service(source_storage, source_access)
+            .await
+            .unwrap();
+
+        let snapshot = read_secret_service_source(&Vec::new()).await.unwrap();
+        assert_eq!(snapshot.collections.len(), 1);
+        assert_eq!(snapshot.collections[0].items.len(), 1);
+
+        drop(source_connection);
+        sleep(Duration::from_millis(50)).await;
+
+        let summary = destination_import::import_snapshot_into_storage(
+            &snapshot,
+            &destination_db_path,
+            "destination-password",
+            CollisionPolicy::Skip,
+        )
+        .unwrap();
+        assert_eq!(summary.items_scanned, 1);
+        assert_eq!(summary.items_imported, 1);
+        assert_eq!(summary.items_failed, 0);
+
+        let mut destination_storage = storage::Storage::open(&destination_db_path).unwrap();
+        destination_storage.unlock("destination-password").unwrap();
+
+        let imported_ids = destination_storage.search_items(&attrs).unwrap();
+        assert_eq!(imported_ids.len(), 1);
+        let imported_item = destination_storage
+            .get_item(imported_ids[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(imported_item.label, "Imported Item");
+        assert_eq!(imported_item.secret, b"imported-secret");
+        assert_eq!(imported_item.attributes, attrs);
     }
 }
