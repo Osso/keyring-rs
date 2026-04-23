@@ -140,20 +140,14 @@ impl SecretService {
         let mut result: HashMap<OwnedObjectPath, Secret> = HashMap::new();
 
         for item_path in items {
-            // Parse item ID from path: /org/freedesktop/secrets/collection/default/{id}
-            let path_str = item_path.as_str();
-            if let Some(id_str) = path_str.rsplit('/').next() {
-                if let Ok(id) = id_str.parse::<u64>() {
-                    if let Ok(Some(item)) = storage.get_item(id) {
-                        let secret = encode_secret_for_transport(
-                            session.clone(),
-                            &session_encryption,
-                            &item.secret,
-                            "text/plain",
-                        )?;
-                        result.insert(item_path, secret);
-                    }
-                }
+            let Some(item_id) = item_id_from_object_path(&item_path) else {
+                continue;
+            };
+
+            if let Some(secret) =
+                secret_for_item_id(&storage, item_id, &session, &session_encryption)?
+            {
+                result.insert(item_path, secret);
             }
         }
 
@@ -815,6 +809,30 @@ fn extract_item_properties(
     (label, attributes)
 }
 
+fn item_id_from_object_path(path: &OwnedObjectPath) -> Option<u64> {
+    path.as_str().rsplit('/').next()?.parse::<u64>().ok()
+}
+
+fn secret_for_item_id(
+    storage: &Storage,
+    item_id: u64,
+    session_path: &OwnedObjectPath,
+    session_encryption: &SessionEncryption,
+) -> zbus::fdo::Result<Option<Secret>> {
+    let item = match storage.get_item(item_id) {
+        Ok(Some(item)) => item,
+        _ => return Ok(None),
+    };
+
+    let secret = encode_secret_for_transport(
+        session_path.clone(),
+        session_encryption,
+        &item.secret,
+        "text/plain",
+    )?;
+    Ok(Some(secret))
+}
+
 async fn register_item_object(
     connection: &Connection,
     storage: Arc<RwLock<Storage>>,
@@ -1309,6 +1327,17 @@ mod tests {
             collection_name_from_path("/org/freedesktop/secrets/collection/a/b"),
             None
         );
+    }
+
+    #[test]
+    fn item_id_from_object_path_parses_terminal_id() {
+        let valid =
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default/42").unwrap();
+        let invalid =
+            OwnedObjectPath::try_from("/org/freedesktop/secrets/collection/default").unwrap();
+
+        assert_eq!(item_id_from_object_path(&valid), Some(42));
+        assert_eq!(item_id_from_object_path(&invalid), None);
     }
 
     #[test]
