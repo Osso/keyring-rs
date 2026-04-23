@@ -89,28 +89,7 @@ impl SecretService {
         algorithm: &str,
         input: Value<'_>,
     ) -> zbus::fdo::Result<(OwnedValue, OwnedObjectPath)> {
-        let (encryption, output) = match algorithm {
-            ALGORITHM_PLAIN => {
-                validate_plain_session_input(&input)?;
-                (
-                    SessionEncryption::Plain,
-                    OwnedValue::try_from(Value::new(String::new())).unwrap(),
-                )
-            }
-            ALGORITHM_DH => {
-                let (session_encryption, service_public_key) =
-                    negotiate_dh_session_encryption(input)?;
-                let output = OwnedValue::try_from(Value::new(service_public_key))
-                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-                (session_encryption, output)
-            }
-            _ => {
-                return Err(zbus::fdo::Error::NotSupported(format!(
-                    "Unsupported algorithm: {}",
-                    algorithm
-                )));
-            }
-        };
+        let (encryption, output) = negotiate_session_open(algorithm, input)?;
 
         register_session_object(&self.connection, self.sessions.clone(), encryption, output).await
     }
@@ -945,6 +924,35 @@ fn prompt_object_path() -> OwnedObjectPath {
 fn session_object_path() -> OwnedObjectPath {
     OwnedObjectPath::try_from(format!("{}/{}", SESSION_PATH_PREFIX, rand::random::<u64>()))
         .expect("session path format is valid")
+}
+
+fn negotiate_session_open(
+    algorithm: &str,
+    input: Value<'_>,
+) -> zbus::fdo::Result<(SessionEncryption, OwnedValue)> {
+    match algorithm {
+        ALGORITHM_PLAIN => open_plain_session(input),
+        ALGORITHM_DH => open_dh_session(input),
+        _ => Err(zbus::fdo::Error::NotSupported(format!(
+            "Unsupported algorithm: {}",
+            algorithm
+        ))),
+    }
+}
+
+fn open_plain_session(input: Value<'_>) -> zbus::fdo::Result<(SessionEncryption, OwnedValue)> {
+    validate_plain_session_input(&input)?;
+    Ok((
+        SessionEncryption::Plain,
+        OwnedValue::try_from(Value::new(String::new())).unwrap(),
+    ))
+}
+
+fn open_dh_session(input: Value<'_>) -> zbus::fdo::Result<(SessionEncryption, OwnedValue)> {
+    let (encryption, service_public_key) = negotiate_dh_session_encryption(input)?;
+    let output = OwnedValue::try_from(Value::new(service_public_key))
+        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+    Ok((encryption, output))
 }
 
 async fn register_session_object(
