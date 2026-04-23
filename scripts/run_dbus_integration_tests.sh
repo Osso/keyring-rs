@@ -35,3 +35,12 @@ run_in_dbus_session \
     --ignored \
     --exact \
     --test-threads=1
+
+run_in_dbus_session \
+  "keyring-ctl ignored source-reader integration tests" \
+  cargo test \
+    --bin keyring-ctl \
+    source_reader::tests::read_unlocked_snapshot_ \
+    -- \
+    --ignored \
+    --test-threads=1

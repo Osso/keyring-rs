@@ -214,9 +214,12 @@ impl SecretServiceSourceReader {
             .await?;
         let (_output, session_path): (OwnedValue, OwnedObjectPath) =
             response.body().deserialize()?;
-        if session_path.as_str().is_empty() {
+        if !session_path
+            .as_str()
+            .starts_with("/org/freedesktop/secrets/session/")
+        {
             return Err(SourceReaderError::InvalidSessionPath(
-                "empty session path".to_string(),
+                session_path.as_str().to_string(),
             ));
         }
         Ok(session_path)
@@ -378,6 +381,12 @@ fn attributes_property(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::AccessControl;
+    use crate::dbus;
+    use crate::storage::Storage;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use zbus::{Connection, interface};
 
     #[test]
     fn collection_name_for_path_extracts_collection_segment() {
@@ -418,5 +427,266 @@ mod tests {
 
         assert!(message.contains("default, login"));
         assert!(message.contains("retry `keyring-ctl import-gnome`"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn read_unlocked_snapshot_reads_live_secret_service_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        storage
+            .create_item(
+                "default",
+                "Source Item",
+                b"source-secret",
+                HashMap::from([
+                    ("service".to_string(), "source.example".to_string()),
+                    ("user".to_string(), "alice".to_string()),
+                ]),
+            )
+            .unwrap();
+
+        let storage = Arc::new(RwLock::new(storage));
+        let access = Arc::new(AccessControl::new(false));
+        let _service = dbus::start_service(storage, access).await.unwrap();
+
+        let snapshot = read_secret_service_source(&[]).await.unwrap();
+        assert_eq!(snapshot.collections.len(), 1);
+        assert_eq!(snapshot.collections[0].name, "default");
+        assert_eq!(snapshot.collections[0].items.len(), 1);
+        assert_eq!(snapshot.collections[0].items[0].label, "Source Item");
+        assert_eq!(
+            snapshot.collections[0].items[0].attributes.get("service"),
+            Some(&"source.example".to_string())
+        );
+        assert_eq!(snapshot.collections[0].items[0].secret, b"source-secret");
+        assert_eq!(snapshot.collections[0].items[0].content_type, "text/plain");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn read_unlocked_snapshot_reports_invalid_session_path() {
+        let _service = start_fake_service(FakeMode::InvalidSessionPath).await;
+        let error = read_secret_service_source(&[]).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SourceReaderError::InvalidSessionPath(ref path) if path == "/"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn read_unlocked_snapshot_reports_secret_session_mismatch() {
+        let _service = start_fake_service(FakeMode::SessionMismatch).await;
+        let error = read_secret_service_source(&[]).await.unwrap_err();
+        assert!(
+            matches!(error, SourceReaderError::SecretSessionMismatch { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn read_unlocked_snapshot_reports_plain_session_encrypted_secret() {
+        let _service = start_fake_service(FakeMode::EncryptedSecret).await;
+        let error = read_secret_service_source(&[]).await.unwrap_err();
+        assert!(
+            matches!(error, SourceReaderError::PlainSessionEncryptedSecret { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires dbus-run-session"]
+    async fn read_unlocked_snapshot_reports_property_decode_failures() {
+        let _service = start_fake_service(FakeMode::MissingCollectionLabel).await;
+        let error = read_secret_service_source(&[]).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SourceReaderError::InvalidProperty { property, .. }
+                    | SourceReaderError::MissingProperty { property, .. }
+                    if property == "Label"
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum FakeMode {
+        InvalidSessionPath,
+        SessionMismatch,
+        EncryptedSecret,
+        MissingCollectionLabel,
+    }
+
+    struct FakeService {
+        mode: FakeMode,
+    }
+
+    #[interface(name = "org.freedesktop.Secret.Service")]
+    impl FakeService {
+        fn open_session(
+            &self,
+            _algorithm: &str,
+            _input: OwnedValue,
+        ) -> zbus::fdo::Result<(OwnedValue, OwnedObjectPath)> {
+            let session = match self.mode {
+                FakeMode::InvalidSessionPath => OwnedObjectPath::try_from("/").unwrap(),
+                _ => OwnedObjectPath::try_from(SESSION_PATH).unwrap(),
+            };
+            Ok((owned(Value::new(String::new())), session))
+        }
+
+        #[zbus(property)]
+        fn collections(&self) -> Vec<OwnedObjectPath> {
+            vec![OwnedObjectPath::try_from(COLLECTION_PATH).unwrap()]
+        }
+    }
+
+    struct FakeCollection;
+
+    #[interface(name = "org.freedesktop.Secret.Collection")]
+    impl FakeCollection {
+        #[zbus(property)]
+        fn locked(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn label(&self) -> String {
+            "Default Collection".to_string()
+        }
+
+        #[zbus(property)]
+        fn items(&self) -> Vec<OwnedObjectPath> {
+            vec![OwnedObjectPath::try_from(ITEM_PATH).unwrap()]
+        }
+    }
+
+    struct FakeCollectionMissingLabel;
+
+    #[interface(name = "org.freedesktop.Secret.Collection")]
+    impl FakeCollectionMissingLabel {
+        #[zbus(property)]
+        fn locked(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn items(&self) -> Vec<OwnedObjectPath> {
+            vec![OwnedObjectPath::try_from(ITEM_PATH).unwrap()]
+        }
+    }
+
+    struct FakeItem {
+        mode: FakeMode,
+    }
+
+    #[interface(name = "org.freedesktop.Secret.Item")]
+    impl FakeItem {
+        fn get_secret(&self, session: OwnedObjectPath) -> zbus::fdo::Result<SecretTuple> {
+            let (returned_session, parameters) = match self.mode {
+                FakeMode::SessionMismatch => (
+                    OwnedObjectPath::try_from(OTHER_SESSION_PATH).unwrap(),
+                    Vec::new(),
+                ),
+                FakeMode::EncryptedSecret => (session.clone(), vec![1, 2, 3]),
+                _ => (session.clone(), Vec::new()),
+            };
+
+            Ok((
+                returned_session,
+                parameters,
+                b"fake-secret".to_vec(),
+                "text/plain".to_string(),
+            ))
+        }
+
+        #[zbus(property)]
+        fn locked(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn label(&self) -> String {
+            "Fake Item".to_string()
+        }
+
+        #[zbus(property)]
+        fn attributes(&self) -> HashMap<String, String> {
+            HashMap::from([("service".to_string(), "fake.example".to_string())])
+        }
+    }
+
+    struct FakeSession;
+
+    #[interface(name = "org.freedesktop.Secret.Session")]
+    impl FakeSession {
+        fn close(&self) -> zbus::fdo::Result<()> {
+            Ok(())
+        }
+    }
+
+    const COLLECTION_PATH: &str = "/org/freedesktop/secrets/collection/default";
+    const ITEM_PATH: &str = "/org/freedesktop/secrets/collection/default/1";
+    const SESSION_PATH: &str = "/org/freedesktop/secrets/session/source";
+    const OTHER_SESSION_PATH: &str = "/org/freedesktop/secrets/session/other";
+
+    async fn start_fake_service(mode: FakeMode) -> Connection {
+        let connection = Connection::session().await.unwrap();
+        register_fake_root(&connection, mode).await;
+        register_fake_collection(&connection, mode).await;
+        register_fake_item_and_session(&connection, mode).await;
+
+        connection.request_name(SECRET_SERVICE_BUS).await.unwrap();
+        connection
+    }
+
+    async fn register_fake_root(connection: &Connection, mode: FakeMode) {
+        connection
+            .object_server()
+            .at(SECRET_SERVICE_PATH, FakeService { mode })
+            .await
+            .unwrap();
+    }
+
+    async fn register_fake_collection(connection: &Connection, mode: FakeMode) {
+        if mode == FakeMode::MissingCollectionLabel {
+            connection
+                .object_server()
+                .at(COLLECTION_PATH, FakeCollectionMissingLabel)
+                .await
+                .unwrap();
+            return;
+        }
+
+        connection
+            .object_server()
+            .at(COLLECTION_PATH, FakeCollection)
+            .await
+            .unwrap();
+    }
+
+    async fn register_fake_item_and_session(connection: &Connection, mode: FakeMode) {
+        connection
+            .object_server()
+            .at(ITEM_PATH, FakeItem { mode })
+            .await
+            .unwrap();
+        connection
+            .object_server()
+            .at(SESSION_PATH, FakeSession)
+            .await
+            .unwrap();
+    }
+
+    fn owned(value: Value<'_>) -> OwnedValue {
+        OwnedValue::try_from(value).unwrap()
     }
 }
