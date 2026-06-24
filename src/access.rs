@@ -129,6 +129,9 @@ fn prompt_authd_sync(caller_exe: &Path, display_name: &str) -> Result<bool, Acce
         env: HashMap::new(),
         password: String::new(),
         confirm_only: true,
+        prompt_title: Some("Keyring access request".to_string()),
+        prompt_message: Some(format!("{display_name} wants to access the keyring")),
+        prompt_detail: Some(caller_exe.display().to_string()),
     };
 
     // Use peercred-ipc Client for proper protocol handling

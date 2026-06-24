@@ -37,8 +37,8 @@ rmp-serde = "1"
 clap = { version = "4.5", features = ["derive"] }
 
 # Auth daemon IPC
-peercred-ipc = { path = "/home/osso/Projects/lib/peercred-ipc" }
-authd-protocol = { path = "/home/osso/Projects/system/authd/protocol" }
+peercred-ipc = { path = "/syncthing/Sync/Projects/lib/peercred-ipc" }
+authd-protocol = { path = "/syncthing/Sync/Projects/system/authd/protocol" }
 keyring-protocol = { path = "protocol" }
 
 [dev-dependencies]

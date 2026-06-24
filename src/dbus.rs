@@ -1272,6 +1272,9 @@ fn confirm_prompt_via_authd_sync(window_id: &str) -> bool {
         env,
         password: String::new(),
         confirm_only: true,
+        prompt_title: Some("Unlock keyring".to_string()),
+        prompt_message: Some("A session is requesting keyring unlock".to_string()),
+        prompt_detail: Some(format!("Window id: {window_id}")),
     };
 
     match IpcClient::call(AUTHD_SOCKET_PATH, &request) {
