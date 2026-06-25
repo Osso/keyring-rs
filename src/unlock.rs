@@ -219,6 +219,22 @@ mod tests {
         stop_server(server_task).await;
     }
 
+    #[tokio::test]
+    #[should_panic(expected = "unlock call did not succeed before timeout")]
+    async fn call_unlock_with_retry_times_out_when_socket_never_appears() {
+        let dir = tempdir().unwrap();
+        let socket_path = dir.path().join("missing.sock");
+
+        call_unlock_with_retry(
+            socket_path,
+            UnlockRequest {
+                user: "alice".to_string(),
+                password: "irrelevant".to_string(),
+            },
+        )
+        .await;
+    }
+
     async fn call_unlock_with_retry(
         socket_path: PathBuf,
         request: UnlockRequest,

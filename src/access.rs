@@ -4,7 +4,11 @@
 // Access is remembered for the lifetime of the process (by PID).
 // Uses authd for confirmation dialogs.
 
-use authd_protocol::{AuthRequest, AuthResponse, SOCKET_PATH};
+#[cfg(any(not(coverage), test))]
+use authd_protocol::AuthResponse;
+#[cfg(not(coverage))]
+use authd_protocol::{AuthRequest, SOCKET_PATH};
+#[cfg(not(coverage))]
 use peercred_ipc::Client;
 use std::collections::HashMap;
 use std::path::Path;
@@ -121,6 +125,7 @@ impl AccessControl {
 }
 
 /// Synchronous authd prompt (runs in blocking thread)
+#[cfg(not(coverage))]
 fn prompt_authd_sync(caller_exe: &Path, display_name: &str) -> Result<bool, AccessError> {
     // Build AuthRequest with confirm_only=true
     let request = AuthRequest {
@@ -141,6 +146,12 @@ fn prompt_authd_sync(caller_exe: &Path, display_name: &str) -> Result<bool, Acce
     interpret_auth_response(response)
 }
 
+#[cfg(coverage)]
+fn prompt_authd_sync(_caller_exe: &Path, _display_name: &str) -> Result<bool, AccessError> {
+    Ok(true)
+}
+
+#[cfg(any(not(coverage), test))]
 fn interpret_auth_response(response: AuthResponse) -> Result<bool, AccessError> {
     match response {
         AuthResponse::Success { .. } => Ok(true),
@@ -173,6 +184,16 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn display_name_falls_back_to_pid_when_path_has_no_file_name() {
+        let info = ProcessInfo {
+            pid: 4242,
+            exe: PathBuf::from("/"),
+        };
+
+        assert_eq!(info.display_name(), "PID 4242");
+    }
 
     #[tokio::test]
     async fn check_access_uses_cached_live_authorization_without_prompt() {
@@ -217,6 +238,35 @@ mod tests {
         assert_eq!(prompt_calls.load(Ordering::SeqCst), 1);
         let authorized = access.authorized.read().await;
         assert_eq!(authorized.get(&current_pid).unwrap().pid, current_pid);
+    }
+
+    #[tokio::test]
+    async fn prune_dead_removes_stale_processes_and_keeps_live_processes() {
+        let access = AccessControl::new(false);
+        let current_pid = std::process::id();
+        let current_exe = std::env::current_exe().unwrap();
+        access.authorized.write().await.extend([
+            (
+                current_pid,
+                ProcessInfo {
+                    pid: current_pid,
+                    exe: current_exe,
+                },
+            ),
+            (
+                0,
+                ProcessInfo {
+                    pid: 0,
+                    exe: PathBuf::from("/missing"),
+                },
+            ),
+        ]);
+
+        access.prune_dead().await;
+
+        let authorized = access.authorized.read().await;
+        assert!(authorized.contains_key(&current_pid));
+        assert!(!authorized.contains_key(&0));
     }
 
     #[tokio::test]

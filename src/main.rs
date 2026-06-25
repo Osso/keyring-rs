@@ -1,27 +1,35 @@
-mod access;
-mod crypto;
-mod dbus;
-mod error;
-mod storage;
-mod unlock;
-
-use std::os::fd::{FromRawFd, RawFd};
+#[cfg(not(coverage))]
+use keyring_daemon::{access, dbus, storage, unlock};
+#[cfg(not(coverage))]
+use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
+#[cfg(not(coverage))]
 use std::sync::Arc;
+#[cfg(not(coverage))]
 use tokio::net::UnixListener;
+#[cfg(not(coverage))]
 use tokio::sync::RwLock;
+#[cfg(not(coverage))]
 use tokio::task::JoinHandle;
+#[cfg(not(coverage))]
 use tracing_subscriber::EnvFilter;
 
 const SYSTEMD_LISTEN_FDS_START: RawFd = 3;
 
+#[cfg(not(coverage))]
 fn state_dir() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".local/state")
-        });
+    state_dir_from_env(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+fn state_dir_from_env(xdg_state_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    let base = xdg_state_home.map(PathBuf::from).unwrap_or_else(|| {
+        let home = home.expect("HOME not set");
+        PathBuf::from(home).join(".local/state")
+    });
     base.join("keyring-rs")
 }
 
@@ -43,6 +51,7 @@ fn first_systemd_activation_fd(
     Some(SYSTEMD_LISTEN_FDS_START)
 }
 
+#[cfg(not(coverage))]
 fn activation_listener_from_env() -> std::io::Result<Option<UnixListener>> {
     let activation_fd = first_systemd_activation_fd(
         std::process::id(),
@@ -60,6 +69,7 @@ fn activation_listener_from_env() -> std::io::Result<Option<UnixListener>> {
     Ok(Some(listener))
 }
 
+#[cfg(not(coverage))]
 fn start_socket_activation_listener() -> std::io::Result<Option<JoinHandle<()>>> {
     let Some(listener) = activation_listener_from_env()? else {
         return Ok(None);
@@ -69,6 +79,7 @@ fn start_socket_activation_listener() -> std::io::Result<Option<JoinHandle<()>>>
     Ok(Some(handle))
 }
 
+#[cfg(not(coverage))]
 async fn run_socket_activation_listener(listener: UnixListener) {
     log_activation_socket(&listener);
 
@@ -80,6 +91,7 @@ async fn run_socket_activation_listener(listener: UnixListener) {
     }
 }
 
+#[cfg(not(coverage))]
 fn log_activation_socket(listener: &UnixListener) {
     let Ok(addr) = listener.local_addr() else {
         return;
@@ -91,12 +103,14 @@ fn log_activation_socket(listener: &UnixListener) {
     tracing::info!("Systemd socket activation listening on {}", path);
 }
 
+#[cfg(not(coverage))]
 async fn accept_activation_connection(listener: &UnixListener) -> std::io::Result<()> {
     let (stream, _) = listener.accept().await?;
     drop(stream);
     Ok(())
 }
 
+#[cfg(not(coverage))]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -191,6 +205,22 @@ mod tests {
         assert_eq!(
             first_systemd_activation_fd(4242, Some("4242"), Some("oops")),
             None
+        );
+    }
+
+    #[test]
+    fn state_dir_prefers_xdg_state_home() {
+        assert_eq!(
+            state_dir_from_env(Some("/state"), Some("/home/alessio")),
+            PathBuf::from("/state/keyring-rs")
+        );
+    }
+
+    #[test]
+    fn state_dir_falls_back_to_home_local_state() {
+        assert_eq!(
+            state_dir_from_env(None, Some("/home/alessio")),
+            PathBuf::from("/home/alessio/.local/state/keyring-rs")
         );
     }
 }

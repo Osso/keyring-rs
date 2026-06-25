@@ -1,24 +1,15 @@
-#[cfg(test)]
-#[path = "../access.rs"]
-mod access;
-#[path = "../crypto.rs"]
-mod crypto;
-#[cfg(test)]
-#[path = "../dbus.rs"]
-mod dbus;
 #[path = "keyring_ctl/destination_import.rs"]
 mod destination_import;
-#[path = "../error.rs"]
-mod error;
 #[path = "keyring_ctl/source_reader.rs"]
 mod source_reader;
-#[path = "../storage.rs"]
-mod storage;
 
 use clap::{Args, Parser, Subcommand};
 use destination_import::{
     CollisionPolicy, DestinationImportError, ImportSummary, import_snapshot_into_default_storage,
 };
+#[cfg(test)]
+use keyring_daemon::{access, dbus};
+use keyring_daemon::{error, storage};
 use source_reader::{SourceSnapshot, read_secret_service_source};
 use thiserror::Error;
 

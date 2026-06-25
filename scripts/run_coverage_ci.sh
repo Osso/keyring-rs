@@ -46,7 +46,7 @@ run_in_dbus_session \
   "Running ignored keyring-daemon D-Bus integration tests for coverage" \
   env LLVM_COV="${LLVM_COV_BIN}" LLVM_PROFDATA="${LLVM_PROFDATA_BIN}" \
     cargo llvm-cov --workspace --all-features --no-report \
-    --bin keyring-daemon \
+    --lib \
     -- \
     --ignored \
     --test-threads=1

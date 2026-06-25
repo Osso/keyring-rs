@@ -709,4 +709,22 @@ mod tests {
         let missing = storage.delete_collection("missing").unwrap();
         assert_eq!(missing, None);
     }
+
+    #[test]
+    fn delete_item_removes_item_and_attributes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path().join("test.db")).unwrap();
+
+        storage.unlock("test-password").unwrap();
+        storage.create_collection("default", "Default").unwrap();
+        let attrs = HashMap::from([("service".to_string(), "mail".to_string())]);
+        let item_id = storage
+            .create_item("default", "Email", b"secret", attrs.clone())
+            .unwrap();
+
+        assert!(storage.delete_item(item_id).unwrap());
+        assert!(storage.get_item(item_id).unwrap().is_none());
+        assert!(storage.search_items(&attrs).unwrap().is_empty());
+        assert!(!storage.delete_item(item_id).unwrap());
+    }
 }
