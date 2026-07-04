@@ -44,7 +44,7 @@ def read_summary(path: Path) -> dict:
 def relative_source_path(filename: str) -> str:
     marker = "/keyring-rs/"
     if marker in filename:
-        return filename.split(marker, 1)[1]
+        return filename.rsplit(marker, 1)[1]
     return filename
 
 
@@ -77,7 +77,9 @@ def first_party_files(summary: dict) -> dict[str, dict]:
     return files
 
 
-def find_line_coverage(files: dict[str, dict], relative_path: str) -> tuple[int, int] | None:
+def find_line_coverage(
+    files: dict[str, dict], relative_path: str
+) -> tuple[int, int] | None:
     suffix = f"/{relative_path}"
     for filename, file_entry in files.items():
         if filename != relative_path and not filename.endswith(suffix):
