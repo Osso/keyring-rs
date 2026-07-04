@@ -18,7 +18,8 @@ jobs:
 
       - name: Checkout path dependencies
         run: |
-          mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          sudo mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          sudo chown -R $USER:$USER /syncthing
           git clone --depth 1 https://github.com/Osso/authd /syncthing/Sync/Projects/system/authd
           git clone --depth 1 https://github.com/Osso/peercred-ipc /syncthing/Sync/Projects/lib/peercred-ipc
 
@@ -47,7 +48,8 @@ jobs:
 
       - name: Checkout path dependencies
         run: |
-          mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          sudo mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          sudo chown -R $USER:$USER /syncthing
           git clone --depth 1 https://github.com/Osso/authd /syncthing/Sync/Projects/system/authd
           git clone --depth 1 https://github.com/Osso/peercred-ipc /syncthing/Sync/Projects/lib/peercred-ipc
 
@@ -73,7 +75,8 @@ jobs:
 
       - name: Checkout path dependencies
         run: |
-          mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          sudo mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          sudo chown -R $USER:$USER /syncthing
           git clone --depth 1 https://github.com/Osso/authd /syncthing/Sync/Projects/system/authd
           git clone --depth 1 https://github.com/Osso/peercred-ipc /syncthing/Sync/Projects/lib/peercred-ipc
 
