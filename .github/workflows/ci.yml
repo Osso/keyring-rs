@@ -16,6 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout path dependencies
+        run: |
+          mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          git clone --depth 1 https://github.com/Osso/authd /syncthing/Sync/Projects/system/authd
+          git clone --depth 1 https://github.com/Osso/peercred-ipc /syncthing/Sync/Projects/lib/peercred-ipc
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,6 +45,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout path dependencies
+        run: |
+          mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          git clone --depth 1 https://github.com/Osso/authd /syncthing/Sync/Projects/system/authd
+          git clone --depth 1 https://github.com/Osso/peercred-ipc /syncthing/Sync/Projects/lib/peercred-ipc
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -58,6 +70,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout path dependencies
+        run: |
+          mkdir -p /syncthing/Sync/Projects/system /syncthing/Sync/Projects/lib
+          git clone --depth 1 https://github.com/Osso/authd /syncthing/Sync/Projects/system/authd
+          git clone --depth 1 https://github.com/Osso/peercred-ipc /syncthing/Sync/Projects/lib/peercred-ipc
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
